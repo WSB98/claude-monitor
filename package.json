@@ -1,0 +1,16 @@
+{
+  "name": "claude-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local dashboard for Claude Code token usage and cost, read from ~/.claude/projects logs.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.11"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "stop": "node server/stop.js"
+  }
+}

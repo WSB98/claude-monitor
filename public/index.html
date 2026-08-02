@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="title">
+        <h1>CLAUDE MONITOR</h1>
+        <span class="sub">local usage / token &amp; cost telemetry</span>
+      </div>
+      <div class="status">
+        <span class="clock" id="clock">--:--:--</span>
+        <span class="dot-row"><span class="dot" id="connDot"></span><span id="connLabel">connecting</span></span>
+      </div>
+    </header>
+
+    <section class="panel network-panel">
+      <div class="panel-head">
+        <h2>Activity Pulse</h2>
+        <span class="hint" id="networkHint">idle</span>
+      </div>
+      <div class="panel-body">
+        <canvas id="network"></canvas>
+      </div>
+    </section>
+
+    <div class="period-switch" id="periodSwitch">
+      <button class="period-btn active" data-period="today">Today</button>
+      <button class="period-btn" data-period="week">7 Days</button>
+      <button class="period-btn" data-period="month">30 Days</button>
+      <button class="period-btn" data-period="year">1 Year</button>
+    </div>
+
+    <section class="hero-grid">
+      <div class="card">
+        <div class="label" id="labelTokens">Tokens</div>
+        <div class="value" id="statTokensPeriod">--</div>
+        <div class="sub" id="statTokensAllTime">--</div>
+      </div>
+      <div class="card">
+        <div class="label" id="labelCost">Est. Cost</div>
+        <div class="value accent-ok" id="statCostPeriod">--</div>
+        <div class="sub" id="statCostAllTime">--</div>
+      </div>
+      <div class="card">
+        <div class="label" id="labelTurns">Turns</div>
+        <div class="value accent-epic" id="statTurnsPeriod">--</div>
+        <div class="sub" id="statSessionsAllTime">--</div>
+      </div>
+      <div class="card">
+        <div class="label">Last Activity</div>
+        <div class="value accent-mythic" id="statLastActivity">--</div>
+        <div class="sub" id="statLastProject">--</div>
+      </div>
+    </section>
+
+    <section class="main-grid">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Token Usage</h2>
+          <div class="chart-switch" id="chartSwitch">
+            <button class="period-btn active" data-gran="daily">Daily</button>
+            <button class="period-btn" data-gran="weekly">Weekly</button>
+            <button class="period-btn" data-gran="monthly">Monthly</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <canvas id="chart"></canvas>
+          <div class="legend">
+            <span><span class="swatch" style="background:var(--info)"></span>Input</span>
+            <span><span class="swatch" style="background:var(--ok)"></span>Output</span>
+            <span><span class="swatch" style="background:var(--dust-600)"></span>Cache</span>
+            <span><span class="swatch" style="background:#9b78d4"></span>Recovered</span>
+            <span><span class="swatch" style="background:rgba(155,120,212,0.4)"></span>~Estimated</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-head"><h2 id="labelByProject">By Project</h2></div>
+          <div class="panel-body bar-list" id="byProject"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2 id="labelByModel">By Model</h2></div>
+          <div class="panel-body bar-list" id="byModel"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>All Projects — Full History</h2>
+          <span class="hint">every project Claude Code has a record of — cost is exact where live-tracked, weighted-estimated otherwise (hover a row for the breakdown)</span>
+        </div>
+        <div class="panel-body bar-list" id="allProjectsHistory"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Live Feed</h2>
+          <span class="hint">most recent turns</span>
+        </div>
+        <div class="panel-body">
+          <div class="feed" id="feed"></div>
+        </div>
+      </div>
+    </section>
+
+    <footer id="footerNote">claude-monitor</footer>
+  </div>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

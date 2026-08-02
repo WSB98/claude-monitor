@@ -1,0 +1,501 @@
+:root {
+  /* Matte warm-dark ladder, darkest to lightest — each tier is a distinct
+     surface, not just a shadow trick, so recessed panels can sit visibly
+     darker than both the page body and the raised cards. --bg-void is the
+     recessed-panel tier: lighter than a true near-black well so it stays
+     legible at chart/table scale, but still the darkest surface. */
+  --bg-void: #0e0d0b;
+  --bg-base: #121110;
+  --bg-raised: #1c1a17;
+  --bg-overlay: #26221e;
+
+  --dust-100: #f0ece3;
+  --dust-200: #ddd9d0;
+  --dust-300: #c4c0b8;
+  --dust-400: #a8a49c;
+  --dust-500: #888480;
+  --dust-600: #5e5c59;
+  --dust-700: #3a3835;
+  --dust-800: #252422;
+  --dust-900: #161513;
+
+  --border-bright: var(--dust-700);
+  --border-mid: #222220;
+  --border-dim: #181816;
+
+  --ok: #62b07d;
+  --warn: #c49a38;
+  --err: #b04848;
+  --info: #4a80a8;
+  --epic: #29b6f6;
+  --mythic: #e8b84c;
+
+  --font-display: 'VT323', monospace;
+  --font-mono: 'Share Tech Mono', monospace;
+  --font-ui: 'Rajdhani', sans-serif;
+
+  /* Neumorphic dark-mode shape language, tuned higher-contrast than
+     typical soft-UI so it reads clearly against a near-black console
+     instead of the usual washed-out low-contrast neumorphism. Cards
+     (.card) are raised/embossed modules; big content panels (.panel) are
+     recessed screens flush-mounted into the same console — same material,
+     shape defined entirely by shadow direction rather than a color jump. */
+  --radius-lg: 18px;
+  --radius-md: 14px;
+  --radius-sm: 8px;
+  --shadow-dark: rgba(0, 0, 0, 0.65);
+  --shadow-light: rgba(255, 255, 255, 0.06);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg-base);
+  color: var(--dust-200);
+  font-family: var(--font-mono);
+  min-height: 100vh;
+  animation: flicker 12s infinite;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 50;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0, 0, 0, 0.06) 2px, rgba(0, 0, 0, 0.06) 4px);
+}
+
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 51;
+  background: radial-gradient(ellipse 90% 88% at 50% 50%, transparent 45%, rgba(0, 0, 0, 0.5) 100%);
+}
+
+@keyframes flicker {
+  0%, 95%, 100% { opacity: 1; }
+  96.5% { opacity: 0.93; }
+  98% { opacity: 0.97; }
+}
+
+.shell {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 32px 28px 64px;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────── */
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 20px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border-mid);
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+
+.title h1 {
+  font-family: var(--font-display);
+  font-size: 34px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--dust-100);
+  text-shadow: 0 0 8px rgba(240, 236, 227, 0.35), 0 0 20px rgba(240, 236, 227, 0.12);
+}
+
+.title .sub {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--dust-500);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--dust-400);
+  letter-spacing: 0.5px;
+}
+
+.status .clock {
+  font-family: var(--font-mono);
+  color: var(--dust-300);
+  font-size: 15px;
+}
+
+.dot-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: uppercase;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dust-700);
+}
+
+.dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 6px rgba(98, 176, 125, 0.8), 0 0 14px rgba(98, 176, 125, 0.35);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.dot.stale {
+  background: var(--err);
+  box-shadow: 0 0 6px rgba(176, 72, 72, 0.7);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+
+.network-panel { margin-bottom: 14px; }
+
+#network {
+  width: 100%;
+  height: 260px;
+  display: block;
+}
+
+.viz-tooltip {
+  position: fixed;
+  z-index: 60;
+  display: none;
+  pointer-events: none;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dust-300);
+  white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.viz-tooltip-title {
+  color: var(--dust-100);
+  font-weight: bold;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+
+.period-switch, .chart-switch {
+  display: flex;
+  gap: 6px;
+}
+
+.period-switch { margin-bottom: 14px; }
+
+.period-btn {
+  background: transparent;
+  border: 1px solid var(--border-mid);
+  color: var(--dust-500);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 5px 11px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+.period-btn:hover { color: var(--dust-300); border-color: var(--border-bright); }
+
+.period-btn.active {
+  color: var(--epic);
+  border-color: var(--epic);
+  box-shadow: 0 0 6px rgba(41, 182, 246, 0.25);
+}
+
+.hero-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 860px) {
+  .split-grid { grid-template-columns: 1fr; }
+}
+
+/* ── Cards & panels ─────────────────────────────────────────────────── */
+
+/* Raised, embossed — a physical gauge module sitting forward of the
+   console. No border: the edge is drawn entirely in shadow, same as real
+   soft-UI. One light source, top-left, applied consistently on every
+   layer so the dark side always lands next to dark and the light side
+   next to light — outer ambient shadow for the floating depth, inset
+   bevel for the edge where the material actually turns, and a hairline
+   rim on top where that bevel catches the most direct light. */
+.card {
+  position: relative;
+  background: var(--bg-raised);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  box-shadow:
+    8px 8px 18px var(--shadow-dark),
+    -6px -6px 16px var(--shadow-light),
+    inset -3px -3px 5px rgba(0, 0, 0, 0.4),
+    inset 3px 3px 5px rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(240, 236, 227, 0.18), transparent);
+}
+
+/* Recessed, inset — a display flush-mounted into the same console, sunk
+   below the surface the cards sit on. Darker than both the page body and
+   the cards (see --bg-void in :root), no border here either — a small
+   outer shadow pair marks where the console's own edge drops into the
+   opening, and the inset pair are the pit's walls, same light direction
+   as the cards so the whole console reads as one consistently-lit scene. */
+.panel {
+  background: var(--bg-void);
+  border-radius: var(--radius-md);
+  box-shadow:
+    4px 4px 10px var(--shadow-dark),
+    -3px -3px 9px var(--shadow-light),
+    inset -5px -5px 12px var(--shadow-dark),
+    inset 4px 4px 10px var(--shadow-light);
+}
+
+.card .label {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--dust-500);
+  margin-bottom: 10px;
+}
+
+.card .value {
+  font-family: var(--font-display);
+  font-size: 40px;
+  line-height: 1;
+  color: var(--dust-100);
+  text-shadow: 0 0 5px rgba(240, 236, 227, 0.45), 0 0 20px rgba(240, 236, 227, 0.18);
+  font-variant-numeric: tabular-nums;
+  transition: filter 0.35s ease-out;
+}
+
+.card .value.accent-ok { color: var(--ok); text-shadow: 0 0 5px rgba(98, 176, 125, 0.55), 0 0 22px rgba(98, 176, 125, 0.25); }
+.card .value.accent-epic { color: var(--epic); text-shadow: 0 0 5px rgba(41, 182, 246, 0.55), 0 0 22px rgba(41, 182, 246, 0.25); }
+.card .value.accent-mythic { color: var(--mythic); text-shadow: 0 0 5px rgba(232, 184, 76, 0.55), 0 0 22px rgba(232, 184, 76, 0.25); }
+
+/* Retro digital-readout flare while a metric is counting up to its new
+   value (see public/animate.js) — brightens then eases back out via the
+   transition above once the class is removed. */
+.digit-roll { filter: brightness(1.4); }
+
+.card .sub {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--dust-500);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-mid);
+}
+
+.panel-head h2 {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--dust-300);
+  font-weight: 600;
+}
+
+.panel-head .hint {
+  font-size: 11px;
+  color: var(--dust-600);
+  text-align: right;
+  max-width: 60%;
+}
+
+.panel-body {
+  padding: 16px 18px 18px;
+}
+
+/* ── Chart ──────────────────────────────────────────────────────────── */
+
+#chart {
+  width: 100%;
+  height: 200px;
+  display: block;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--dust-400);
+}
+
+.legend .swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+/* ── Ranked bar lists ───────────────────────────────────────────────── */
+
+.bar-list { display: flex; flex-direction: column; gap: 10px; }
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 108px 1fr 78px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.bar-row .name {
+  color: var(--dust-300);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-track {
+  position: relative;
+  height: 7px;
+  background: var(--dust-800);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: inset 1px 1px 3px var(--shadow-dark);
+}
+
+.bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 4px;
+  background: var(--epic);
+  transition: width 0.5s ease-out, left 0.5s ease-out;
+}
+
+.bar-fill-estimated {
+  background: rgba(155, 120, 212, 0.4);
+}
+
+.bar-row .value {
+  text-align: right;
+  color: var(--dust-400);
+  font-variant-numeric: tabular-nums;
+  transition: filter 0.35s ease-out;
+}
+
+.empty-note {
+  color: var(--dust-600);
+  font-size: 12.5px;
+  padding: 4px 0;
+}
+
+/* ── Live feed ──────────────────────────────────────────────────────── */
+
+.feed { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; }
+
+.feed-row {
+  display: grid;
+  grid-template-columns: 74px 1fr auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border-dim);
+  font-size: 12px;
+}
+
+.feed-row:last-child { border-bottom: none; }
+
+.feed-row .time { color: var(--dust-600); font-variant-numeric: tabular-nums; }
+.feed-row .project { color: var(--dust-300); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.chip {
+  font-size: 10.5px;
+  letter-spacing: 0.5px;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  border: 1px solid currentColor;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.chip.opus { color: var(--mythic); }
+.chip.sonnet { color: var(--epic); }
+.chip.haiku { color: var(--ok); }
+.chip.fable { color: var(--warn); }
+.chip.other { color: var(--dust-500); }
+
+.feed-row .tokens { color: var(--dust-400); font-variant-numeric: tabular-nums; text-align: right; }
+.feed-row .cost { color: var(--dust-200); font-variant-numeric: tabular-nums; text-align: right; min-width: 58px; }
+
+.feed-row.fresh { animation: rowflash 1.4s ease-out; }
+@keyframes rowflash {
+  0% { background: rgba(98, 176, 125, 0.18); }
+  100% { background: transparent; }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--dust-700); border-radius: 4px; }
+
+footer {
+  margin-top: 28px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--dust-700);
+  letter-spacing: 0.5px;
+}
