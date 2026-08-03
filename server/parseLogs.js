@@ -119,7 +119,7 @@ function parseFile(filePath, isSubagent) {
         records.push({
           timestamp: obj.timestamp,
           model: obj.message.model,
-          project: projectNameFromCwd(obj.cwd),
+          cwd: obj.cwd,
           sessionId: obj.session_id || obj.sessionId,
           agentId: obj.agentId || null,
           agentType: meta?.agentType || null,
@@ -137,7 +137,7 @@ function parseFile(filePath, isSubagent) {
   const pending = lastTurn?.type === 'user'
     ? {
         timestamp: lastTurn.timestamp,
-        project: projectNameFromCwd(lastTurn.cwd),
+        cwd: lastTurn.cwd,
         sessionId: lastTurn.session_id || lastTurn.sessionId,
         agentId: lastTurn.agentId || null,
         agentType: meta?.agentType || null,
@@ -167,14 +167,45 @@ function parsedFile(filePath, isSubagent) {
   return entry;
 }
 
+// A project's display name comes from whichever cwd is found first among
+// its main-thread session files, checked before any subagent file — that's
+// the cwd that actually determined which project directory Claude Code
+// filed everything under, so it's applied to every record and subagent
+// found here rather than trusting each one's own possibly-drifted cwd.
+// Without this, a subagent (or a mid-session `cd`) that ran one level into
+// a subdirectory — e.g. a monorepo's api/ folder — would get silently
+// split out into its own fake "project" instead of rolling up into the
+// real one.
+function resolveProjectDir(projectDir) {
+  const files = listSessionFiles(projectDir);
+  const ordered = [...files].sort((a, b) => Number(a.isSubagent) - Number(b.isSubagent));
+  let projectName = null;
+  for (const file of ordered) {
+    try {
+      const { records, pending } = parsedFile(file.path, file.isSubagent);
+      const cwd = records[0]?.cwd || pending?.cwd;
+      if (cwd) {
+        projectName = projectNameFromCwd(cwd);
+        break;
+      }
+    } catch {
+      // file may have been rotated/deleted mid-scan — try the next one
+    }
+  }
+  return { files, projectName: projectName || 'unknown' };
+}
+
 // Returns every usage record across every local Claude Code project log,
 // main-thread and subagent alike.
 export function collectUsageRecords() {
   const all = [];
   for (const projectDir of listProjectDirs()) {
-    for (const file of listSessionFiles(projectDir)) {
+    const { files, projectName } = resolveProjectDir(projectDir);
+    for (const file of files) {
       try {
-        all.push(...parsedFile(file.path, file.isSubagent).records);
+        for (const rec of parsedFile(file.path, file.isSubagent).records) {
+          all.push({ ...rec, project: projectName });
+        }
       } catch {
         // file may have been rotated/deleted mid-scan — skip it this pass
       }
@@ -190,10 +221,11 @@ export function collectUsageRecords() {
 export function collectPendingTurns() {
   const all = [];
   for (const projectDir of listProjectDirs()) {
-    for (const file of listSessionFiles(projectDir)) {
+    const { files, projectName } = resolveProjectDir(projectDir);
+    for (const file of files) {
       try {
         const pending = parsedFile(file.path, file.isSubagent).pending;
-        if (pending) all.push(pending);
+        if (pending) all.push({ ...pending, project: projectName });
       } catch {
         // file may have been rotated/deleted mid-scan — skip it this pass
       }

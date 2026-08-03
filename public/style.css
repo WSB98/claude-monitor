@@ -30,9 +30,26 @@
   --epic: #29b6f6;
   --mythic: #e8b84c;
 
-  --font-display: 'VT323', monospace;
-  --font-mono: 'Share Tech Mono', monospace;
-  --font-ui: 'Rajdhani', sans-serif;
+  /* Fonts are modular: each *-custom slot is the one thing meant to be
+     edited — point it at your own Google Fonts (or other @font-face)
+     family, or leave it as-is to use the defaults imported in
+     index.html. The *-fallback stacks are full system-font chains and
+     don't need to change; if a *-custom font isn't loaded (import
+     removed, offline, blocked), the browser just falls through to them
+     automatically — nothing else has to be touched either way.
+     Display's fallback is ordered thinner-first: at 28-32px Consolas
+     reads noticeably wider/rounder than it does in body text. */
+  --font-display-custom: 'VT323';
+  --font-mono-custom: 'Share Tech Mono';
+  --font-ui-custom: 'Rajdhani';
+
+  --font-display-fallback: 'Lucida Console', 'Cascadia Mono', 'Cascadia Code', Monaco, Menlo, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  --font-mono-fallback: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Monaco, 'Courier New', monospace;
+  --font-ui-fallback: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+
+  --font-display: var(--font-display-custom), var(--font-display-fallback);
+  --font-mono: var(--font-mono-custom), var(--font-mono-fallback);
+  --font-ui: var(--font-ui-custom), var(--font-ui-fallback);
 
   /* Neumorphic dark-mode shape language, tuned higher-contrast than
      typical soft-UI so it reads clearly against a near-black console
@@ -107,7 +124,7 @@ header {
 
 .title h1 {
   font-family: var(--font-display);
-  font-size: 34px;
+  font-size: 28px;
   font-weight: 400;
   letter-spacing: 2px;
   color: var(--dust-100);
@@ -312,7 +329,7 @@ header {
 
 .card .value {
   font-family: var(--font-display);
-  font-size: 40px;
+  font-size: 32px;
   line-height: 1;
   color: var(--dust-100);
   text-shadow: 0 0 5px rgba(240, 236, 227, 0.45), 0 0 20px rgba(240, 236, 227, 0.18);

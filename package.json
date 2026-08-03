@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Local dashboard for Claude Code token usage and cost, read from ~/.claude/projects logs.",
+  "author": "wsb98",
   "license": "MIT",
   "engines": {
     "node": ">=18.11"

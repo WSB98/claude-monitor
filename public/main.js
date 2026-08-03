@@ -109,7 +109,7 @@ function drawChart(points) {
     }
     if (i % labelStride === 0) {
       ctx.fillStyle = '#5e5c59';
-      ctx.font = '10px "Share Tech Mono", monospace';
+      ctx.font = '10px "Share Tech Mono", ui-monospace, "Cascadia Code", "Segoe UI Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Monaco, "Courier New", monospace';
       ctx.textAlign = 'center';
       ctx.fillText(d.label, x + barW / 2, h - 6);
     }

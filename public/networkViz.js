@@ -247,7 +247,7 @@ export function createNetworkViz(canvas) {
     const marginY = Math.max(26, h * 0.16);
     const colX = [w * 0.08, w * 0.36, w * 0.64, w * 0.92];
 
-    ctx.font = '9px "Share Tech Mono", monospace';
+    ctx.font = '9px "Share Tech Mono", ui-monospace, "Cascadia Code", "Segoe UI Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Monaco, "Courier New", monospace';
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(168,164,156,0.4)';
     COLUMN_LABELS.forEach((label, i) => ctx.fillText(label, colX[i], 12));
