@@ -3,31 +3,29 @@
 // decreasing confidence — a prompt is classified into exactly one:
 //
 //  - "live": exact, straight from the JSONL scan (server/parseLogs.js).
-//  - "recovered": stats-cache.json's real lifetime token/cost totals for
-//    whatever window it tracked before it stopped updating. A real dollar
-//    pool that gets *redistributed* — by day (for the monthly chart, using
-//    stats-cache's own daily activity weights) and independently by
-//    project (using each project's share of prompts in that window, since
-//    stats-cache has no project dimension at all). Both redistributions
-//    always sum back to the exact recovered total for whatever portion of
-//    that window doesn't overlap the live scan — days at/after the live
-//    scan's earliest surviving event are excluded from the pool entirely so
-//    a transcript that outlives stats-cache's last computation, or a
-//    stats-cache recomputed later than a transcript's retention window,
-//    never gets counted on both sides.
+//  - "recovered": stats-cache.json's real day×model token counts
+//    (server/history.js), each priced through that model's own real
+//    lifetime rate — a real dollar figure per day, not a window-wide
+//    blend. Split across projects using THAT day's real prompt mix from
+//    history.jsonl (a day-level join), falling back to the whole
+//    recovered window's project mix only for a day stats-cache has data
+//    for but history.jsonl doesn't (the two files can have different
+//    retention). Days at/after the live scan's earliest surviving event
+//    are excluded entirely so a transcript that outlives stats-cache's
+//    last computation, or a stats-cache recomputed later than a
+//    transcript's retention window, never gets counted on both sides.
 //  - "estimated": everything else — prompts with no real dollar pool to
-//    redistribute at all, because Claude Code had already deleted that
-//    usage data before this tool ever ran. Extrapolated from a blended
-//    $/prompt and token/prompt rate built from the live+recovered prompts
-//    (the only ones with a known cost), applied to however many prompts
-//    fall outside both windows. This is the roughest tier — it assumes a
-//    typical prompt costs about the same everywhere, which can overstate
-//    quick one-off sessions and understate heavy ones — and it's the only
-//    tier that can attach a number to projects with zero surviving
-//    transcripts and zero overlap with the recovered window (most of the
-//    projects in allProjectsHistory fall here).
+//    draw from at all, because Claude Code had already deleted that usage
+//    data before this tool ever ran. Priced per-project using that
+//    project's OWN blended $/prompt rate from its live+recovered history
+//    when it has any, falling back to a global blended rate (built from
+//    every live+recovered prompt) only for a project with zero known cost
+//    anywhere. Still the roughest tier — it assumes a typical prompt in
+//    that project cost about the same throughout — but it no longer
+//    assumes every project's prompts cost the same as every other
+//    project's, the way a single global rate would.
 //
-// The same blended rate and the same per-tier totals feed both the overall
+// The same per-tier totals feed both the overall
 // `totals`/`periods.year`/`charts.monthly` numbers and the per-project
 // breakdown in `allProjectsHistory`, so the sum across every project always
 // reconciles exactly with the top-level totals — nothing is invented in
@@ -48,50 +46,10 @@ export function mergeHistorical(liveResult, recoveredStats, promptHistory) {
   const monthly = liveResult.charts.monthly.map((pt) => ({ ...pt }));
   const monthByKey = new Map(monthly.map((pt) => [pt.key, pt]));
 
-  // ── Tier "recovered": redistribute stats-cache.json's exact pool across
-  // the days it actually spans, weighted by its own daily token data. ──
-  let recoveredTokens = 0;
-  let recoveredCostUsd = 0;
-  let yearShareRecoveredTokens = 0;
-  let yearShareRecoveredCostUsd = 0;
-
-  if (recoveredStats) {
-    // recoveredTokens/recoveredCostUsd (used below in `totals`) are built by
-    // summing only the surviving (non-overlapping) days in this loop, NOT
-    // assigned from recoveredStats.totalTokens/totalCostUsd directly. If
-    // stats-cache.json's tracked window runs later than liveFirstMs — it's
-    // recomputed periodically and can outlive an individual transcript's
-    // retention — the overlap would otherwise be counted once here via the
-    // unclipped lifetime total AND again via the live scan's own totals for
-    // those same days. Skipping those days (as the chart redistribution
-    // below already did) and summing only what's left keeps this in exact
-    // reconciliation with what actually lands in the monthly chart.
-    for (const day of recoveredStats.dailyTokens) {
-      const dayMs = new Date(day.date).getTime();
-      if (dayMs >= liveFirstMs) continue; // already covered, more accurately, by the live scan
-      const share = day.tokens / recoveredStats.dailyTokenSum;
-      const dayCostUsd = recoveredStats.totalCostUsd * share;
-
-      recoveredTokens += day.tokens;
-      recoveredCostUsd += dayCostUsd;
-
-      const monthPt = monthByKey.get(day.date.slice(0, 7));
-      if (monthPt) {
-        monthPt.recovered = (monthPt.recovered || 0) + day.tokens;
-        monthPt.costUsd = (monthPt.costUsd || 0) + dayCostUsd;
-      }
-      if (nowMs - dayMs <= YEAR_MS) {
-        yearShareRecoveredTokens += day.tokens;
-        yearShareRecoveredCostUsd += dayCostUsd;
-      }
-    }
-  }
-
   // ── Single pass over promptHistory: classify every prompt into live /
-  // recovered / estimated, tallying whatever each tier needs. Recovered
-  // only needs per-project counts here (its day-level split already came
-  // from stats-cache.json above); estimated needs per-project AND
-  // per-month counts, since promptHistory is its only source at all. ──
+  // recovered / estimated, tallying whatever each tier needs, PLUS a
+  // day-level project breakdown (independent of tier) used below to split
+  // each recovered day's real dollar figure by project. ──
   const recoveredStartMs = recoveredStats?.firstSessionDate ? new Date(recoveredStats.firstSessionDate).getTime() : null;
   const recoveredEndMs = recoveredStats?.lastComputedDate ? new Date(recoveredStats.lastComputedDate).getTime() : null;
 
@@ -99,14 +57,24 @@ export function mergeHistorical(liveResult, recoveredStats, promptHistory) {
   let recoveredWindowPromptCount = 0;
   let estimatedPromptCount = 0;
   let estimatedYearPromptCount = 0;
+  const liveCountsByProject = new Map();
   const recoveredCountsByProject = new Map();
   const estimatedCountsByProject = new Map();
   const estimatedCountsByMonth = new Map();
+  const promptCountByDay = new Map(); // dayKey -> total prompts that day, any project
+  const projectCountsByDay = new Map(); // dayKey -> Map(project -> count)
 
   for (const p of promptHistory) {
     const ms = new Date(p.timestamp).getTime();
+    const dayKey = p.timestamp.slice(0, 10);
+    promptCountByDay.set(dayKey, (promptCountByDay.get(dayKey) || 0) + 1);
+    const dayProjects = projectCountsByDay.get(dayKey) || new Map();
+    dayProjects.set(p.project, (dayProjects.get(p.project) || 0) + 1);
+    projectCountsByDay.set(dayKey, dayProjects);
+
     if (ms >= liveFirstMs) {
       liveWindowPromptCount += 1;
+      liveCountsByProject.set(p.project, (liveCountsByProject.get(p.project) || 0) + 1);
     } else if (recoveredStartMs != null && ms >= recoveredStartMs && ms < recoveredEndMs) {
       recoveredWindowPromptCount += 1;
       recoveredCountsByProject.set(p.project, (recoveredCountsByProject.get(p.project) || 0) + 1);
@@ -119,16 +87,65 @@ export function mergeHistorical(liveResult, recoveredStats, promptHistory) {
     }
   }
 
-  // ── Tier "estimated": blended rate, applied to whatever fell outside
-  // both real windows above. ──
+  // ── Tier "recovered": stats-cache.json's real per-day cost (already
+  // priced per-model in server/history.js) redistributed across projects
+  // using that same day's real prompt mix. ──
+  let recoveredTokens = 0;
+  let recoveredCostUsd = 0;
+  let yearShareRecoveredTokens = 0;
+  let yearShareRecoveredCostUsd = 0;
+  const recoveredCostByProject = new Map();
+
+  if (recoveredStats) {
+    for (const day of recoveredStats.dailyTokens) {
+      const dayMs = new Date(day.date).getTime();
+      if (dayMs >= liveFirstMs) continue; // already covered, more accurately, by the live scan
+
+      recoveredTokens += day.tokens;
+      recoveredCostUsd += day.costUsd;
+
+      const monthPt = monthByKey.get(day.date.slice(0, 7));
+      if (monthPt) {
+        monthPt.recovered = (monthPt.recovered || 0) + day.tokens;
+        monthPt.costUsd = (monthPt.costUsd || 0) + day.costUsd;
+      }
+      if (nowMs - dayMs <= YEAR_MS) {
+        yearShareRecoveredTokens += day.tokens;
+        yearShareRecoveredCostUsd += day.costUsd;
+      }
+
+      const dayProjects = projectCountsByDay.get(day.date);
+      const dayPromptTotal = promptCountByDay.get(day.date) || 0;
+      if (dayProjects && dayPromptTotal > 0) {
+        for (const [project, count] of dayProjects) {
+          recoveredCostByProject.set(project, (recoveredCostByProject.get(project) || 0) + day.costUsd * (count / dayPromptTotal));
+        }
+      } else if (recoveredWindowPromptCount > 0) {
+        // history.jsonl has nothing for this specific day (retention gap
+        // between the two files) — fall back to each project's share of
+        // the whole recovered window instead of dropping the day's dollars.
+        for (const [project, count] of recoveredCountsByProject) {
+          recoveredCostByProject.set(project, (recoveredCostByProject.get(project) || 0) + day.costUsd * (count / recoveredWindowPromptCount));
+        }
+      }
+    }
+  }
+
+  // ── Tier "estimated": blended rate (per-project below, globally here as
+  // its fallback), applied to whatever fell outside both real windows. ──
   const knownCostUsd = (liveResult.totals.costUsd || 0) + recoveredCostUsd;
   const knownTokens = (liveResult.totals.tokens || 0) + recoveredTokens;
   const knownPromptCount = liveWindowPromptCount + recoveredWindowPromptCount;
   const avgCostPerPrompt = knownPromptCount > 0 ? knownCostUsd / knownPromptCount : 0;
   const avgTokensPerPrompt = knownPromptCount > 0 ? knownTokens / knownPromptCount : 0;
 
+  // estimatedCostUsd itself is NOT `estimatedPromptCount * avgCostPerPrompt`
+  // here — it's accumulated below from each project's own rate, so the
+  // global total is the literal sum of the per-project figures rather than
+  // two independently-computed numbers that could disagree. estimatedTokens
+  // stays global-rate-based since no per-project token breakdown is ever
+  // surfaced for it to need to reconcile against.
   const estimatedTokens = estimatedPromptCount * avgTokensPerPrompt;
-  const estimatedCostUsd = estimatedPromptCount * avgCostPerPrompt;
   const yearShareEstimatedTokens = estimatedYearPromptCount * avgTokensPerPrompt;
   const yearShareEstimatedCostUsd = estimatedYearPromptCount * avgCostPerPrompt;
 
@@ -150,16 +167,26 @@ export function mergeHistorical(liveResult, recoveredStats, promptHistory) {
     ? new Date(Math.min(...candidateFirsts.map((d) => new Date(d).getTime()))).toISOString()
     : liveResult.firstEventAt;
 
-  // ── Per-project totals — same rate, same pools as above, so the sum
+  // ── Per-project totals — same tiers, same pools as above, so the sum
   // across every project reconciles exactly with the totals below. ──
   const liveCostByProject = new Map(liveResult.byProject.map((p) => [p.project, p.costUsd]));
   const allProjects = new Set([...liveCostByProject.keys(), ...recoveredCountsByProject.keys(), ...estimatedCountsByProject.keys()]);
   const projectCosts = new Map();
+  let estimatedCostUsd = 0;
   for (const project of allProjects) {
     const liveCostUsd = liveCostByProject.get(project) || 0;
-    const recoveredShare = recoveredWindowPromptCount > 0 ? (recoveredCountsByProject.get(project) || 0) / recoveredWindowPromptCount : 0;
-    const projRecoveredCostUsd = recoveredShare * recoveredCostUsd;
-    const projEstimatedCostUsd = (estimatedCountsByProject.get(project) || 0) * avgCostPerPrompt;
+    const projRecoveredCostUsd = recoveredCostByProject.get(project) || 0;
+
+    // A project's own blended $/prompt from its real (live+recovered)
+    // history — falls back to the global blend only when this project has
+    // no known cost anywhere, so one project's typical prompt cost never
+    // gets assumed for another's.
+    const projKnownCostUsd = liveCostUsd + projRecoveredCostUsd;
+    const projKnownPromptCount = (liveCountsByProject.get(project) || 0) + (recoveredCountsByProject.get(project) || 0);
+    const projAvgCostPerPrompt = projKnownPromptCount > 0 ? projKnownCostUsd / projKnownPromptCount : avgCostPerPrompt;
+    const projEstimatedCostUsd = (estimatedCountsByProject.get(project) || 0) * projAvgCostPerPrompt;
+    estimatedCostUsd += projEstimatedCostUsd;
+
     projectCosts.set(project, {
       liveCostUsd,
       recoveredCostUsd: projRecoveredCostUsd,
