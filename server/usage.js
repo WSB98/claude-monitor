@@ -3,13 +3,21 @@
 // this comes from). pricing.js, parseLogs.js, and aggregate.js all read
 // through this module instead of each re-deriving the cache_creation split.
 
+// `cache_creation` (when present) splits cache writes by TTL, and is the
+// authoritative breakdown — `cache_creation_input_tokens` is just their sum.
+// Only when the split is absent (older logs) is the whole write treated as
+// the 5-minute tier, which was the only tier back then.
 export function cacheSplit(usage) {
-  const cc = usage.cache_creation || {};
-  return {
-    write5m: cc.ephemeral_5m_input_tokens ?? usage.cache_creation_input_tokens ?? 0,
-    write1h: cc.ephemeral_1h_input_tokens ?? 0,
-    read: usage.cache_read_input_tokens ?? 0,
-  };
+  const cc = usage.cache_creation;
+  const read = usage.cache_read_input_tokens ?? 0;
+  if (cc && typeof cc === 'object') {
+    return {
+      write5m: cc.ephemeral_5m_input_tokens ?? 0,
+      write1h: cc.ephemeral_1h_input_tokens ?? 0,
+      read,
+    };
+  }
+  return { write5m: usage.cache_creation_input_tokens ?? 0, write1h: 0, read };
 }
 
 export function usageBreakdown(usage) {

@@ -17,12 +17,29 @@ function buildSinceNote(data) {
   if (!data.firstEventAt) return '';
   let note = ` · tracking since ${new Date(data.firstEventAt).toLocaleDateString()}`;
   const ds = data.dataSources;
-  if (ds?.recoveredRange) {
-    note += ` (live since ${new Date(ds.liveSince).toLocaleDateString()}, ${formatCost(data.totals.recoveredCostUsd)} recovered`;
-    note += ds.gapTurns ? `, ~${formatCost(data.totals.estimatedCostUsd)} estimated from ${ds.gapTurns} untracked turns)` : ')';
+  const t = data.totals;
+  const parts = [];
+  const rec = ds?.reconciliation;
+  if (ds?.liveSince) {
+    let exact = `exact since ${new Date(ds.liveSince).toLocaleDateString()}`;
+    if (rec?.reportedCostUsd > 0) exact += `, incl. ${formatCost(rec.reportedCostUsd)} transcripts missed that Claude Code's own cost records show`;
+    parts.push(exact);
   }
-  if (data.totals.unpricedTokens > 0) {
-    note += ` · ${formatTokens(data.totals.unpricedTokens)} tok un-priced, no rate for ${data.totals.unpricedModels.join(', ')} (cost totals under-count by that amount)`;
+  if (t.recoveredCostUsd > 0) parts.push(`${formatCost(t.recoveredCostUsd)} recovered from Claude Code's records for ${ds.recoveredTurns} prompts whose transcripts are gone`);
+  const pe = ds?.promptEstimate;
+  if (ds?.gapTurns && pe) {
+    let est = `~${formatCost(pe.costUsd)} estimated for ${ds.gapTurns} prompts with no surviving data`;
+    if (pe.range) est += ` (plausible ${formatCost(pe.range.low)}–${formatCost(pe.range.high)})`;
+    if (pe.model) est += `, modeled on your own ${pe.model.basisSessions} sessions by prompt position, project and period`;
+    parts.push(est);
+  }
+  if (rec?.modeledCostUsd > 0) parts.push(`~${formatCost(rec.modeledCostUsd)} modeled for logged responses missing their final usage`);
+  if (parts.length) note += ` (${parts.join('; ')})`;
+  if (t.unpricedTokens > 0) {
+    note += ` · ${formatTokens(t.unpricedTokens)} tok un-priced, no rate for ${t.unpricedModels.join(', ')} (cost totals under-count by that amount)`;
+  }
+  if (t.approxPricedModels?.length) {
+    note += ` · priced at nearest known family rate: ${t.approxPricedModels.join(', ')}`;
   }
   return note;
 }
@@ -35,10 +52,10 @@ function costBreakdownTitle(totals) {
 
 function modelFamily(model) {
   if (!model) return 'other';
+  if (/fable|mythos/i.test(model)) return 'fable';
   if (/opus/i.test(model)) return 'opus';
   if (/sonnet/i.test(model)) return 'sonnet';
   if (/haiku/i.test(model)) return 'haiku';
-  if (/fable|mythos/i.test(model)) return 'fable';
   return 'other';
 }
 
@@ -50,7 +67,38 @@ tickClock();
 
 // ── Chart ────────────────────────────────────────────────────────────
 
-const chartColors = { input: '#4a80a8', output: '#62b07d', cache: '#5e5c59', recovered: '#9b78d4', estimated: 'rgba(155,120,212,0.4)' };
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// Canvas can't read CSS variables, so the chart pulls the same tokens the
+// legend swatches use. Recovered/estimated are tiers, not token types: they
+// reuse the neutral "project" ink as faded / hatched fills, the same fill
+// styles the bar lists use for those tiers.
+function chartPalette() {
+  return {
+    input: cssVar('--tok-input'),
+    output: cssVar('--tok-output'),
+    cache: cssVar('--tok-cache'),
+    tier: cssVar('--project-bar'),
+    recoveredOpacity: Number(cssVar('--tier-recovered-opacity')) || 0.55,
+    estimatedOpacity: Number(cssVar('--tier-estimated-opacity')) || 0.45,
+  };
+}
+
+function hatchPattern(ctx, color) {
+  const c = document.createElement('canvas');
+  c.width = 6;
+  c.height = 6;
+  const g = c.getContext('2d');
+  g.strokeStyle = color;
+  g.lineWidth = 2;
+  g.beginPath();
+  g.moveTo(-1, 7);
+  g.lineTo(7, -1);
+  g.stroke();
+  return ctx.createPattern(c, 'repeat');
+}
+
+let chartBars = []; // [{x, w, point}] from the last draw, for hover hit-testing
 
 function drawChart(points) {
   const canvas = el('chart');
@@ -64,6 +112,7 @@ function drawChart(points) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
+  const pal = chartPalette();
 
   const padLeft = 8;
   const padRight = 8;
@@ -89,26 +138,32 @@ function drawChart(points) {
   const gap = 6;
   const barW = Math.max(4, (plotW - gap * (n - 1)) / n);
   const labelStride = n > 12 ? 2 : 1;
+  const hatch = hatchPattern(ctx, pal.tier);
+  chartBars = [];
 
   points.forEach((d, i) => {
     const x = padLeft + i * (barW + gap);
+    chartBars.push({ x, w: barW, point: d });
     let y = padTop + plotH;
     const segs = [
-      [d.input, chartColors.input],
-      [d.output, chartColors.output],
-      [d.cache, chartColors.cache],
-      [d.recovered || 0, chartColors.recovered],
-      [d.estimated || 0, chartColors.estimated],
+      [d.cache, pal.cache, 1],
+      [d.input, pal.input, 1],
+      [d.output, pal.output, 1],
+      [d.recovered || 0, pal.tier, pal.recoveredOpacity],
+      [d.estimated || 0, hatch, pal.estimatedOpacity],
     ];
-    for (const [val, color] of segs) {
+    for (const [val, fill, alpha] of segs) {
       const segH = (val / max) * plotH;
       if (segH <= 0) continue;
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y - segH, barW, segH);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = fill;
+      // 1px surface gap between stacked segments once they're tall enough to show it
+      ctx.fillRect(x, y - segH, barW, segH > 3 ? segH - 1 : segH);
+      ctx.globalAlpha = 1;
       y -= segH;
     }
     if (i % labelStride === 0) {
-      ctx.fillStyle = '#5e5c59';
+      ctx.fillStyle = cssVar('--dust-600');
       ctx.font = '10px "Share Tech Mono", ui-monospace, "Cascadia Code", "Segoe UI Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Monaco, "Courier New", monospace';
       ctx.textAlign = 'center';
       ctx.fillText(d.label, x + barW / 2, h - 6);
@@ -116,15 +171,58 @@ function drawChart(points) {
   });
 }
 
+// Per-bar hover: the whole column (not just the painted part) is the hit
+// target, so near-empty days are still inspectable.
+function setupChartTooltip() {
+  const canvas = el('chart');
+  const tip = document.createElement('div');
+  tip.className = 'chart-tip';
+  document.body.appendChild(tip);
+  const row = (swatchStyle, label, tokens, cost) =>
+    `<div><span class="tip-sw" style="${swatchStyle}"></span>${label} ${formatTokens(tokens)} tok${cost != null ? ` · ${formatCost(cost)}` : ''}</div>`;
+  canvas.addEventListener('mousemove', (e) => {
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    const bar = chartBars.find((b) => mx >= b.x - 3 && mx <= b.x + b.w + 3);
+    if (!bar) {
+      tip.style.display = 'none';
+      return;
+    }
+    const d = bar.point;
+    const pal = chartPalette();
+    let html = `<div class="tip-title">${escapeHtml(d.key)} · ${formatCost(d.costUsd)}</div>`;
+    if (d.input + d.output + d.cache > 0) {
+      html += row(`background:${pal.output}`, 'output', d.output, null);
+      html += row(`background:${pal.input}`, 'input', d.input, null);
+      html += row(`background:${pal.cache}`, 'cache', d.cache, null);
+      html += `<div style="color:var(--dust-500)">exact cost ${formatCost(d.liveCostUsd)}</div>`;
+    }
+    if (d.recovered > 0) html += row(`background:${pal.tier};opacity:${pal.recoveredOpacity}`, 'recovered', d.recovered, d.recoveredCostUsd);
+    if (d.estimated > 0) html += row(`background:repeating-linear-gradient(45deg, ${pal.tier} 0 2px, transparent 2px 4px)`, '~estimated', d.estimated, d.estimatedCostUsd);
+    tip.innerHTML = html;
+    tip.style.display = 'block';
+    const tw = tip.offsetWidth;
+    tip.style.left = Math.min(window.innerWidth - tw - 8, e.clientX + 14) + 'px';
+    tip.style.top = e.clientY + 14 + 'px';
+  });
+  canvas.addEventListener('mouseleave', () => {
+    tip.style.display = 'none';
+  });
+}
+setupChartTooltip();
+
 // ── Bar lists ────────────────────────────────────────────────────────
 
+// Every cost list (By Project, By Model, All Projects) draws the same way:
+// one bar per row, split into tier segments — solid for exact live spend,
+// faded for recovered, faded + hatched for ~estimated — in the row's own
+// color (its model family's hue for models, neutral ink for projects).
 // Rows are keyed by name and reused across polls (rather than torn down and
-// rebuilt every 5s) so the bar-fill width can transition smoothly and the
-// cost value can count up instead of just snapping to the new number.
-function renderBarList(containerId, rows, nameKey) {
+// rebuilt every 5s) so widths can transition and values can count up.
+function renderBarList(containerId, rows, { nameKey, colorFor = () => 'var(--project-bar)', titleFor = null, emptyNote = 'no data yet' }) {
   const container = el(containerId);
   if (!rows.length) {
-    container.innerHTML = '<div class="empty-note">no data yet</div>';
+    container.innerHTML = `<div class="empty-note">${emptyNote}</div>`;
     return;
   }
   if (container.querySelector('.empty-note')) container.innerHTML = '';
@@ -140,16 +238,44 @@ function renderBarList(containerId, rows, nameKey) {
       div.className = 'bar-row';
       div.dataset.key = key;
       div.innerHTML = `
-        <span class="name" title="${escapeHtml(row[nameKey])}">${escapeHtml(row[nameKey])}</span>
-        <span class="bar-track"><span class="bar-fill" style="width:0%"></span></span>
+        <span class="name"></span>
+        <span class="bar-track">
+          <span class="bar-fill seg-live" style="left:0%;width:0%"></span>
+          <span class="bar-fill seg-recovered" style="left:0%;width:0%"></span>
+          <span class="bar-fill seg-estimated" style="left:0%;width:0%"></span>
+        </span>
         <span class="value"></span>
       `;
     }
     if (container.children[i] !== div) container.insertBefore(div, container.children[i] || null);
+    div.classList.toggle('is-other', Boolean(row.isOther));
+    div.style.setProperty('--bar-color', colorFor(row));
 
-    const pct = Math.max(2, ((row.costUsd || 0) / max) * 100);
-    div.querySelector('.bar-fill').style.width = pct + '%';
-    animateNumber(div.querySelector('.value'), row.costUsd || 0, formatCost);
+    const total = row.costUsd || 0;
+    const live = row.liveCostUsd ?? total;
+    const recovered = row.recoveredCostUsd || 0;
+    const estimated = row.estimatedCostUsd || 0;
+    const totalPct = Math.max(2, (total / max) * 100);
+    const livePct = total > 0 ? (live / total) * totalPct : totalPct;
+    const recoveredPct = total > 0 ? (recovered / total) * totalPct : 0;
+    const estimatedPct = Math.max(0, totalPct - livePct - recoveredPct);
+    const approx = recovered > 0 || estimated > 0;
+
+    const nameEl = div.querySelector('.name');
+    nameEl.textContent = row[nameKey];
+    nameEl.title = titleFor
+      ? titleFor(row)
+      : `${row[nameKey]} · ${formatCost(total)}` + (approx ? ` (live ${formatCost(live)}, recovered ${formatCost(recovered)}, ~estimated ${formatCost(estimated)})` : '');
+
+    div.querySelector('.seg-live').style.width = livePct + '%';
+    const rec = div.querySelector('.seg-recovered');
+    rec.style.left = livePct + '%';
+    rec.style.width = recoveredPct + '%';
+    const est = div.querySelector('.seg-estimated');
+    est.style.left = livePct + recoveredPct + '%';
+    est.style.width = estimatedPct + '%';
+
+    animateNumber(div.querySelector('.value'), total, (v) => (approx ? '~' : '') + formatCost(v));
   });
 
   [...container.children].forEach((child) => {
@@ -157,69 +283,19 @@ function renderBarList(containerId, rows, nameKey) {
   });
 }
 
-// Turn-count breakdown from history.jsonl — every project ever touched,
-// regardless of whether its own transcripts still exist. Distinct data
-// (and distinct color, matching the chart's "recovered" segments) from the
-// cost-based By Project list above, which only reflects live-tracked spend.
-// Each bar is itself a stacked breakdown — solid cyan for exact live cost,
-// solid purple for a project's share of the recovered pool, translucent
-// purple for the extrapolated estimate — same color language as the chart.
+const modelColor = (row) => (row.isOther ? 'var(--model-other)' : `var(--model-${modelFamily(row.model)})`);
+
+// Every project Claude Code has a record of, regardless of whether its own
+// transcripts still exist — exact live cost where they do, recovered or
+// ~estimated otherwise (see server/merge.js).
 function renderProjectHistoryList(rows) {
-  const container = el('allProjectsHistory');
-  if (!rows.length) {
-    container.innerHTML = '<div class="empty-note">no prompt history found</div>';
-    return;
-  }
-  if (container.querySelector('.empty-note')) container.innerHTML = '';
-
-  const max = Math.max(...rows.map((r) => r.totalCostUsd || 0), 0.0001);
-  const seen = new Set();
-  rows.forEach((row, i) => {
-    const key = String(row.project);
-    seen.add(key);
-    let div = container.querySelector(`:scope > [data-key="${CSS.escape(key)}"]`);
-    if (!div) {
-      div = document.createElement('div');
-      div.className = 'bar-row';
-      div.dataset.key = key;
-      div.innerHTML = `
-        <span class="name"></span>
-        <span class="bar-track">
-          <span class="bar-fill seg-live" style="left:0%;width:0%;background:var(--epic)"></span>
-          <span class="bar-fill seg-recovered" style="left:0%;width:0%;background:#9b78d4"></span>
-          <span class="bar-fill bar-fill-estimated seg-estimated" style="left:0%;width:0%"></span>
-        </span>
-        <span class="value"></span>
-      `;
-    }
-    if (container.children[i] !== div) container.insertBefore(div, container.children[i] || null);
-
-    const total = row.totalCostUsd || 0;
-    const totalPct = Math.max(2, (total / max) * 100);
-    const livePct = total > 0 ? (row.liveCostUsd / total) * totalPct : 0;
-    const recoveredPct = total > 0 ? (row.recoveredCostUsd / total) * totalPct : 0;
-    const estimatedPct = Math.max(0, totalPct - livePct - recoveredPct);
-    const isEstimated = row.recoveredCostUsd > 0 || row.estimatedCostUsd > 0;
-    const range = row.firstSeen ? `${new Date(row.firstSeen).toLocaleDateString()} → ${new Date(row.lastSeen).toLocaleDateString()}` : 'no prompt-history entries';
-    const breakdown = `live ${formatCost(row.liveCostUsd)}, recovered ${formatCost(row.recoveredCostUsd)}, ~estimated ${formatCost(row.estimatedCostUsd)}`;
-
-    const nameEl = div.querySelector('.name');
-    nameEl.textContent = row.project;
-    nameEl.title = `${row.project} · ${row.turns} turns · ${range} · ${breakdown}`;
-
-    div.querySelector('.seg-live').style.width = livePct + '%';
-    const recoveredSeg = div.querySelector('.seg-recovered');
-    recoveredSeg.style.left = livePct + '%';
-    recoveredSeg.style.width = recoveredPct + '%';
-    const estimatedSeg = div.querySelector('.seg-estimated');
-    estimatedSeg.style.left = livePct + recoveredPct + '%';
-    estimatedSeg.style.width = estimatedPct + '%';
-
-    animateNumber(div.querySelector('.value'), total, (v) => (isEstimated ? '~' : '') + formatCost(v));
-  });
-
-  [...container.children].forEach((child) => {
-    if (child.dataset && !seen.has(child.dataset.key)) child.remove();
+  renderBarList('allProjectsHistory', rows.map((r) => ({ ...r, costUsd: r.totalCostUsd })), {
+    nameKey: 'project',
+    emptyNote: 'no prompt history found',
+    titleFor: (row) => {
+      const range = row.firstSeen ? `${new Date(row.firstSeen).toLocaleDateString()} → ${new Date(row.lastSeen).toLocaleDateString()}` : 'no prompt-history entries';
+      return `${row.project} · ${row.turns} prompts · ${range} · live ${formatCost(row.liveCostUsd)}, recovered ${formatCost(row.recoveredCostUsd)}, ~estimated ${formatCost(row.estimatedCostUsd)}`;
+    },
   });
 }
 
@@ -266,11 +342,19 @@ function renderPeriodStats(data) {
   el('labelTurns').textContent = `Turns — ${label}`;
   el('labelByProject').textContent = `By Project — ${label}`;
   el('labelByModel').textContent = `By Model — ${label}`;
-  renderBarList('byProject', p.byProject || [], 'project');
-  renderBarList('byModel', p.byModel || [], 'model');
-  animateNumber(el('statTokensPeriod'), p.tokens, formatTokens);
-  animateNumber(el('statCostPeriod'), p.costUsd, formatCost);
+  renderBarList('byProject', p.byProject || [], { nameKey: 'project' });
+  renderBarList('byModel', p.byModel || [], { nameKey: 'model', colorFor: modelColor });
+  // A period that reaches back past the surviving transcripts includes
+  // recovered/estimated spend — marked "~" like the all-time totals.
+  const periodApprox = p.recoveredCostUsd > 0 || p.estimatedCostUsd > 0;
+  animateNumber(el('statTokensPeriod'), p.tokens, (v) => (periodApprox ? '~' : '') + formatTokens(v));
+  animateNumber(el('statCostPeriod'), p.costUsd, (v) => (periodApprox ? '~' : '') + formatCost(v));
+  const periodTitle = periodApprox ? costBreakdownTitle(p) : '';
+  el('statTokensPeriod').title = periodTitle;
+  el('statCostPeriod').title = periodTitle;
+  // Turns = billed API responses, counted only where transcripts survive.
   animateNumber(el('statTurnsPeriod'), p.turns, (v) => String(Math.round(v)));
+  el('statTurnsPeriod').title = 'billed API responses in surviving transcripts';
   const hasEstimate = data.totals.recoveredCostUsd > 0 || data.totals.estimatedCostUsd > 0;
   animateNumber(el('statTokensAllTime'), data.totals.tokens, (v) => (hasEstimate ? '~' : '') + formatTokens(v) + ' all-time');
   animateNumber(el('statCostAllTime'), data.totals.costUsd, (v) => (hasEstimate ? '~' : '') + formatCost(v) + ' all-time');
@@ -323,12 +407,9 @@ async function poll() {
       el('footerNote').textContent = 'no ~/.claude/projects directory found on this machine';
     } else {
       const historyCount = data.allProjectsHistory.length;
-      const projectNote = `${data.scannedProjects} project${data.scannedProjects === 1 ? '' : 's'} on disk · ${data.byProject.length} with live transcripts`;
+      const projectNote = `${data.scannedProjects} project${data.scannedProjects === 1 ? '' : 's'} on disk · ${data.allProjectsHistory.filter((r) => r.liveCostUsd > 0).length} with live transcripts`;
       const historyNote = historyCount ? ` · ${historyCount} in full history` : '';
-      const liveOnlyNote = data.liveOnlyFiles
-        ? ` · ${data.liveOnlyFiles} oversized transcript${data.liveOnlyFiles === 1 ? '' : 's'} tracked for live activity only (not in totals)`
-        : '';
-      el('footerNote').textContent = `claude-monitor · ${projectNote}${historyNote}${liveOnlyNote}${buildSinceNote(data)}`;
+      el('footerNote').textContent = `claude-monitor · ${projectNote}${historyNote}${buildSinceNote(data)}`;
     }
 
     renderPeriodStats(data);

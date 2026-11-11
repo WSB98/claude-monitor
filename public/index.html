@@ -82,11 +82,11 @@
         <div class="panel-body">
           <canvas id="chart"></canvas>
           <div class="legend">
-            <span><span class="swatch" style="background:var(--info)"></span>Input</span>
-            <span><span class="swatch" style="background:var(--ok)"></span>Output</span>
-            <span><span class="swatch" style="background:var(--dust-600)"></span>Cache</span>
-            <span><span class="swatch" style="background:#9b78d4"></span>Recovered</span>
-            <span><span class="swatch" style="background:rgba(155,120,212,0.4)"></span>~Estimated</span>
+            <span><span class="swatch" style="background:var(--tok-output)"></span>Output</span>
+            <span><span class="swatch" style="background:var(--tok-input)"></span>Input</span>
+            <span><span class="swatch" style="background:var(--tok-cache)"></span>Cache</span>
+            <span><span class="swatch tier-recovered"></span>Recovered</span>
+            <span><span class="swatch tier-estimated"></span>~Estimated</span>
           </div>
         </div>
       </div>
@@ -105,7 +105,12 @@
       <div class="panel">
         <div class="panel-head">
           <h2>All Projects — Full History</h2>
-          <span class="hint">every project Claude Code has a record of — cost is exact where live-tracked, weighted-estimated otherwise (hover a row for the breakdown)</span>
+          <span class="hint">every project Claude Code has a record of — hover a row for the breakdown</span>
+          <div class="legend">
+            <span><span class="swatch tier-live"></span>Exact</span>
+            <span><span class="swatch tier-recovered"></span>Recovered</span>
+            <span><span class="swatch tier-estimated"></span>~Estimated</span>
+          </div>
         </div>
         <div class="panel-body bar-list" id="allProjectsHistory"></div>
       </div>

@@ -30,6 +30,34 @@
   --epic: #29b6f6;
   --mythic: #e8b84c;
 
+  /* Model families — one fixed hue per family, used for every model mark
+     (feed chips, By Model bars, activity-pulse model nodes). Validated as a
+     set on the panel surface: every pair >= 15 dE for normal vision; worst
+     colorblind pair (haiku/opus, protan) is 6.9 dE, so model marks always
+     carry their name as text too. Don't reuse these hues for anything else. */
+  --model-opus: #c98500;
+  --model-sonnet: #3987e5;
+  --model-haiku: #008300;
+  --model-fable: #d55181;
+  --model-other: #888480;
+
+  /* Token types (usage chart + pulse token column) — a separate validated
+     set, all pairs pass on the panel surface. Cache gets a real hue rather
+     than gray: it's the bulk of every bar and must not read as the neutral
+     recovered/estimated tier fills. Where these share a view with model
+     hues (the pulse), column position + labels keep them apart. */
+  --tok-input: #9085e9;
+  --tok-output: #d95926;
+  --tok-cache: #199e70;
+
+  /* Projects have no hue of their own (too many to color apart). */
+  --project-bar: #c4c0b8;
+
+  /* Data tiers are a fill style on top of whatever color the mark has:
+     exact = solid, recovered = faded, ~estimated = faded + 45deg hatch. */
+  --tier-recovered-opacity: 0.55;
+  --tier-estimated-opacity: 0.45;
+
   /* Fonts are modular: each *-custom slot is the one thing meant to be
      edited — point it at your own Google Fonts (or other @font-face)
      family, or leave it as-is to use the defaults imported in
@@ -440,13 +468,44 @@ header {
   position: absolute;
   inset: 0 auto 0 0;
   border-radius: 4px;
-  background: var(--epic);
+  background: var(--bar-color, var(--project-bar));
   transition: width 0.5s ease-out, left 0.5s ease-out;
 }
 
-.bar-fill-estimated {
-  background: rgba(155, 120, 212, 0.4);
+/* Tier segments of a stacked bar; a 2px surface gap separates them. */
+.bar-fill.seg-recovered,
+.bar-fill.seg-estimated { border-left: 2px solid var(--dust-800); }
+.bar-fill.seg-recovered { opacity: var(--tier-recovered-opacity); }
+.bar-fill.seg-estimated {
+  opacity: var(--tier-estimated-opacity);
+  background: repeating-linear-gradient(45deg, var(--bar-color, var(--project-bar)) 0 3px, transparent 3px 5px);
 }
+
+/* Legend swatches for the tiers, matching the bar fills above. */
+.swatch.tier-live { background: var(--project-bar); }
+.swatch.tier-recovered { background: var(--project-bar); opacity: var(--tier-recovered-opacity); }
+.swatch.tier-estimated { background: repeating-linear-gradient(45deg, var(--project-bar) 0 3px, transparent 3px 5px); opacity: 0.8; }
+
+.bar-row.is-other .name { color: var(--dust-500); font-style: italic; }
+
+/* Hover tooltip for the usage chart. */
+.chart-tip {
+  position: fixed;
+  z-index: 20;
+  pointer-events: none;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  font-size: 11.5px;
+  color: var(--dust-300);
+  line-height: 1.5;
+  box-shadow: 0 4px 14px var(--shadow-dark);
+  display: none;
+  white-space: nowrap;
+}
+.chart-tip .tip-title { color: var(--dust-100); margin-bottom: 2px; }
+.chart-tip .tip-sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: 0; }
 
 .bar-row .value {
   text-align: right;
@@ -485,16 +544,27 @@ header {
   letter-spacing: 0.5px;
   padding: 2px 7px;
   border-radius: var(--radius-sm);
-  border: 1px solid currentColor;
+  border: 1px solid var(--chip-color);
+  color: var(--dust-300); /* text stays in text ink; the border + dot carry the family hue */
   text-transform: uppercase;
   white-space: nowrap;
 }
+.chip::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: 1px;
+  background: var(--chip-color);
+}
 
-.chip.opus { color: var(--mythic); }
-.chip.sonnet { color: var(--epic); }
-.chip.haiku { color: var(--ok); }
-.chip.fable { color: var(--warn); }
-.chip.other { color: var(--dust-500); }
+.chip.opus { --chip-color: var(--model-opus); }
+.chip.sonnet { --chip-color: var(--model-sonnet); }
+.chip.haiku { --chip-color: var(--model-haiku); }
+.chip.fable { --chip-color: var(--model-fable); }
+.chip.other { --chip-color: var(--model-other); }
 
 .feed-row .tokens { color: var(--dust-400); font-variant-numeric: tabular-nums; text-align: right; }
 .feed-row .cost { color: var(--dust-200); font-variant-numeric: tabular-nums; text-align: right; min-width: 58px; }

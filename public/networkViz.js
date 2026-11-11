@@ -11,7 +11,7 @@
 // so a heavier turn visibly pushes more signal through more of the graph.
 // A session/subagent that's mid-turn — prompt or tool result submitted, no
 // reply logged yet — shows up the instant it starts (aggregate.js's
-// isThinking, sourced from parseLogs.js's collectPendingTurns) with a
+// isThinking, sourced from parseLogs.js's pendingTurns) with a
 // pulsing ring instead of waiting for its first billed token.
 //
 // Every dot — session/subagent nodes and the Project/Model/Token-type
@@ -26,10 +26,11 @@ const MAX_PROJECTS = 8;
 const MAX_MODELS = 6;
 const MAX_PARTICLES = 5;
 
+// Same tokens as the usage chart's legend (--tok-*).
 const TOKEN_TYPES = [
-  { key: 'input', col: '74,128,168' }, // --info
-  { key: 'output', col: '98,176,125' }, // --ok
-  { key: 'cache', col: '94,92,89' }, // --dust-600
+  { key: 'input', cssVar: '--tok-input' },
+  { key: 'output', cssVar: '--tok-output' },
+  { key: 'cache', cssVar: '--tok-cache' },
 ];
 
 const COLUMN_LABELS = ['PROJECTS', 'SESSIONS', 'MODELS', 'TOKENS'];
@@ -41,13 +42,24 @@ function volumeScale(v, max) {
   return Math.max(0, Math.min(1, Math.log10(v + 1) / Math.log10(max + 1)));
 }
 
+// Model-family hues come from the same CSS tokens as the feed chips and
+// the By Model bars (--model-*), as "r,g,b" for the rgba() fills below.
+const familyRgb = new Map();
+function rgbOfVar(name) {
+  if (familyRgb.has(name)) return familyRgb.get(name);
+  const hex = getComputedStyle(document.documentElement).getPropertyValue(name).trim().replace('#', '');
+  const rgb = hex.length === 6 ? [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(',') : '168,164,156';
+  familyRgb.set(name, rgb);
+  return rgb;
+}
+
 function colorFor(model) {
-  if (!model) return '168,164,156';
-  if (/opus/i.test(model)) return '232,184,76'; // mythic
-  if (/sonnet/i.test(model)) return '41,182,246'; // epic
-  if (/haiku/i.test(model)) return '98,176,125'; // ok
-  if (/fable|mythos/i.test(model)) return '196,154,56'; // warn
-  return '168,164,156'; // dust-400
+  if (!model) return rgbOfVar('--model-other');
+  if (/fable|mythos/i.test(model)) return rgbOfVar('--model-fable');
+  if (/opus/i.test(model)) return rgbOfVar('--model-opus');
+  if (/sonnet/i.test(model)) return rgbOfVar('--model-sonnet');
+  if (/haiku/i.test(model)) return rgbOfVar('--model-haiku');
+  return rgbOfVar('--model-other');
 }
 
 export function createNetworkViz(canvas) {
@@ -213,7 +225,7 @@ export function createNetworkViz(canvas) {
     const tokenPos = stack(TOKEN_TYPES.map((tt) => tt.key), colX[3], h, marginY);
     TOKEN_TYPES.forEach((tt) => {
       const pos = tokenPos.get(tt.key);
-      ctx.fillStyle = `rgba(${tt.col},${0.12 + breathe * 0.1})`;
+      ctx.fillStyle = `rgba(${rgbOfVar(tt.cssVar)},${0.12 + breathe * 0.1})`;
       ctx.beginPath();
       ctx.arc(pos.x, pos.y, 3 + breathe, 0, Math.PI * 2);
       ctx.fill();
@@ -232,7 +244,6 @@ export function createNetworkViz(canvas) {
     lines.push(n.isThinking ? `thinking since ${formatRelative(n.thinkingSince)}` : `last event ${formatRelative(n.lastEventAt)}`);
     lines.push(`${formatTokens(n.tokens)} tok / ${formatCost(n.costUsd)} (5m window)`);
     if (n.tokens) lines.push(`in ${formatTokens(n.input)} · out ${formatTokens(n.output)} · cache ${formatTokens(n.cache)}`);
-    if (n.liveOnly) lines.push('oversized transcript · live only, not in totals');
     return lines;
   }
 
@@ -329,8 +340,8 @@ export function createNetworkViz(canvas) {
           const sink = tokenPos.get(tt.key);
           const share = volumeScale(val, maxNodeTok);
           const sCount = 1 + Math.round(share * (MAX_PARTICLES - 2));
-          drawEdge(mid, sink, tt.col, 0.04 + share * 0.16, false);
-          drawParticles(mid, sink, tt.col, sCount, t, i + tt.key.length, 900);
+          drawEdge(mid, sink, rgbOfVar(tt.cssVar), 0.04 + share * 0.16, false);
+          drawParticles(mid, sink, rgbOfVar(tt.cssVar), sCount, t, i + tt.key.length, 900);
         }
       }
 
@@ -372,7 +383,7 @@ export function createNetworkViz(canvas) {
       const vol = volumeScale(typeTok[tt.key], maxTypeTok);
       const pos = tokenPos.get(tt.key);
       const r = 3.5 + vol * 2.5;
-      drawNode(pos, r, tt.col, anyLive ? 0.2 + vol * 0.4 : 0);
+      drawNode(pos, r, rgbOfVar(tt.cssVar), anyLive ? 0.2 + vol * 0.4 : 0);
       const share = typeTotalTok ? Math.round((typeTok[tt.key] / typeTotalTok) * 100) : 0;
       frameHitTargets.push({
         x: pos.x,

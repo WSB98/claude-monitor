@@ -3,9 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { join, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectLogs, logRootExists, scannedProjectCount } from './parseLogs.js';
-import { aggregate } from './aggregate.js';
-import { readRecoveredStats, readPromptHistory } from './history.js';
-import { mergeHistorical } from './merge.js';
+import { readRecoveredStats, readPromptHistory, readReportedSessions } from './history.js';
+import { buildReport } from './merge.js';
 
 const HOST = '127.0.0.1'; // localhost only — this exposes local project names and usage patterns, no reason to put it on the LAN
 const PORT = process.env.PORT ? Number(process.env.PORT) : 5787;
@@ -48,10 +47,9 @@ async function serveStatic(req, res) {
 function serveUsage(req, res) {
   let payload;
   try {
-    const { records, pendingTurns, liveOnlyFiles } = collectLogs();
-    const live = aggregate(records, pendingTurns);
-    const merged = mergeHistorical(live, readRecoveredStats(), readPromptHistory());
-    payload = { ok: true, logRootExists: logRootExists(), scannedProjects: scannedProjectCount(), liveOnlyFiles, ...merged };
+    const logs = collectLogs();
+    const report = buildReport({ ...logs, recoveredStats: readRecoveredStats(), promptHistory: readPromptHistory(), reportedSessions: readReportedSessions() });
+    payload = { ok: true, logRootExists: logRootExists(), scannedProjects: scannedProjectCount(), ...report };
   } catch (err) {
     payload = { ok: false, error: err.message };
   }
@@ -66,6 +64,15 @@ const server = createServer((req, res) => {
   }
   serveStatic(req, res);
 });
+
+// The first scan reads every transcript in full (a second or two for
+// several hundred MB); do it up front so the first page load doesn't wait.
+// Later polls only read what was appended.
+try {
+  collectLogs();
+} catch {
+  // surfaced on the first /api/usage request instead
+}
 
 server.listen(PORT, HOST, () => {
   console.log(`claude-monitor running at http://${HOST}:${PORT} (localhost only)`);

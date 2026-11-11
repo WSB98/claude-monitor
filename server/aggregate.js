@@ -1,5 +1,5 @@
-import { usageBreakdown as breakdown } from './usage.js';
-import { costForUsage } from './pricing.js';
+import { usageBreakdown, cacheSplit } from './usage.js';
+import { costForUsage, resolveModel } from './pricing.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HISTORY_DAYS = 14;
@@ -15,138 +15,300 @@ export const LIVE_WINDOW_MS = 30 * 1000;
 export const WARM_WINDOW_MS = 5 * 60 * 1000;
 
 // A session/subagent stuck on an open "user" turn (see parseLogs.js's
-// collectPendingTurns) with no reply for longer than this is treated as
-// abandoned rather than still thinking, so a crashed or walked-away-from
-// session doesn't light up the pulse forever.
+// pendingTurns) with no reply for longer than this is treated as abandoned
+// rather than still thinking, so a crashed or walked-away-from session
+// doesn't light up the pulse forever.
 const THINKING_TIMEOUT_MS = 10 * 60 * 1000;
 
-const PERIOD_WINDOWS_MS = {
-  today: DAY_MS,
-  week: 7 * DAY_MS,
-  month: 30 * DAY_MS,
-  year: 365 * DAY_MS,
-};
+export const TIERS = ['live', 'recovered', 'estimated'];
 
-function dayKeyOf(iso) {
-  return iso.slice(0, 10);
+// ── Local calendar helpers ──────────────────────────────────────────────
+// This server only ever runs on the same machine as the browser viewing it,
+// so the server's local timezone is the viewer's: "Today" and every day /
+// month bucket follow the local calendar rather than UTC (which would put
+// an evening's work in the US onto the next day).
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+export function localDayKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+export function localMonthKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+}
+
+function startOfLocalDay(ms) {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// ── Rollup ──────────────────────────────────────────────────────────────
+// Every view of spend — all-time totals, the period cards, the By Project /
+// By Model panels, all three charts, and the full-history project list —
+// is computed from one stream of entries, so they all reconcile exactly.
+// An entry is one slice of spend in one tier:
+//  - live: one billed API response, exact, from a transcript on disk.
+//  - recovered: Claude Code's own stats-cache.json totals for days whose
+//    transcripts are gone (see merge.js).
+//  - estimated: prompts from history.jsonl whose transcripts are gone and
+//    that no recovered total covers, priced at a measured average rate.
+
+function emptyTok() {
+  return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+}
+
+function tokSum(t) {
+  return t.input + t.output + t.cacheWrite + t.cacheRead;
 }
 
 function emptyBucket() {
-  return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, costUsd: 0, turns: 0 };
+  // liveTok: the exact (live-tier) part of this bucket, by token type.
+  const b = { ...emptyTok(), costUsd: 0, turns: 0, liveTok: emptyTok() };
+  for (const t of TIERS) b[t] = { tokens: 0, costUsd: 0 };
+  return b;
 }
 
-function accumulate(bucket, tok, costUsd) {
-  bucket.input += tok.input;
-  bucket.output += tok.output;
-  bucket.cacheWrite += tok.cacheWrite;
-  bucket.cacheRead += tok.cacheRead;
-  bucket.costUsd += costUsd || 0;
-  bucket.turns += 1;
+function addToBucket(b, e) {
+  b.input += e.tok.input;
+  b.output += e.tok.output;
+  b.cacheWrite += e.tok.cacheWrite;
+  b.cacheRead += e.tok.cacheRead;
+  b.costUsd += e.costUsd;
+  b.turns += e.turns;
+  b[e.tier].tokens += tokSum(e.tok);
+  b[e.tier].costUsd += e.costUsd;
+  if (e.tier === 'live') addTok(b.liveTok, e.tok);
 }
 
-function bumpMap(map, key, tok, costUsd) {
-  const bucket = map.get(key) || emptyBucket();
-  accumulate(bucket, tok, costUsd);
-  map.set(key, bucket);
+function bump(map, key, e) {
+  let b = map.get(key);
+  if (!b) map.set(key, (b = emptyBucket()));
+  addToBucket(b, e);
 }
 
-function bucketTokens(bucket) {
-  return bucket.input + bucket.output + bucket.cacheWrite + bucket.cacheRead;
+export function createRollup(now = Date.now()) {
+  const periodStarts = {
+    today: startOfLocalDay(now),
+    week: now - 7 * DAY_MS,
+    month: now - 30 * DAY_MS,
+    year: now - 365 * DAY_MS,
+  };
+  const periods = {};
+  for (const k of Object.keys(periodStarts)) periods[k] = { bucket: emptyBucket(), byProject: new Map(), byModel: new Map() };
+  return {
+    now,
+    periodStarts,
+    totals: emptyBucket(),
+    periods,
+    byDay: new Map(),
+    byWeekIdx: new Map(),
+    byMonth: new Map(),
+    byProject: new Map(),
+    byModel: new Map(),
+  };
 }
 
-function withTokens(bucket) {
-  return { ...bucket, tokens: bucketTokens(bucket) };
+// entry: { ms, project, model, tier, tok: {input, output, cacheWrite, cacheRead}, costUsd, turns }
+export function addEntry(r, e) {
+  addToBucket(r.totals, e);
+  for (const [k, start] of Object.entries(r.periodStarts)) {
+    if (e.ms >= start) {
+      const p = r.periods[k];
+      addToBucket(p.bucket, e);
+      bump(p.byProject, e.project, e);
+      bump(p.byModel, e.model, e);
+    }
+  }
+  bump(r.byDay, localDayKey(e.ms), e);
+  bump(r.byMonth, localMonthKey(e.ms), e);
+  const weekIdx = Math.max(0, Math.floor((r.now - e.ms) / (7 * DAY_MS)));
+  if (weekIdx < HISTORY_WEEKS) bump(r.byWeekIdx, weekIdx, e);
+  bump(r.byProject, e.project, e);
+  bump(r.byModel, e.model, e);
 }
 
-function chartPoint(bucket, label, key) {
+function publicBucket(b) {
+  return {
+    input: b.input,
+    output: b.output,
+    cacheWrite: b.cacheWrite,
+    cacheRead: b.cacheRead,
+    tokens: tokSum(b),
+    costUsd: b.costUsd,
+    turns: b.turns,
+    liveTokens: b.live.tokens,
+    liveCostUsd: b.live.costUsd,
+    recoveredTokens: b.recovered.tokens,
+    recoveredCostUsd: b.recovered.costUsd,
+    estimatedTokens: b.estimated.tokens,
+    estimatedCostUsd: b.estimated.costUsd,
+  };
+}
+
+// The stacked chart splits exact (live) tokens by type, and shows each
+// non-exact tier as its own segment rather than implying a precise
+// input/output/cache split for it.
+function chartPoint(b, label, key) {
   return {
     key,
     label,
-    input: bucket?.input || 0,
-    output: bucket?.output || 0,
-    cache: (bucket?.cacheWrite || 0) + (bucket?.cacheRead || 0),
-    costUsd: bucket?.costUsd || 0,
+    input: b?.liveTok.input || 0,
+    output: b?.liveTok.output || 0,
+    cache: (b?.liveTok.cacheWrite || 0) + (b?.liveTok.cacheRead || 0),
+    recovered: b?.recovered.tokens || 0,
+    estimated: b?.estimated.tokens || 0,
+    costUsd: b?.costUsd || 0,
+    liveCostUsd: b?.live.costUsd || 0,
+    recoveredCostUsd: b?.recovered.costUsd || 0,
+    estimatedCostUsd: b?.estimated.costUsd || 0,
   };
 }
+
+// Top rows by cost. Anything past the limit is folded into one "+N more"
+// row (isOther) rather than dropped, so a list always sums to its total.
+function rankedList(map, keyName, limit = TOP_N) {
+  const rows = [...map.entries()]
+    .map(([key, b]) => ({
+      [keyName]: key,
+      tokens: tokSum(b),
+      costUsd: b.costUsd,
+      turns: b.turns,
+      liveCostUsd: b.live.costUsd,
+      recoveredCostUsd: b.recovered.costUsd,
+      estimatedCostUsd: b.estimated.costUsd,
+    }))
+    .sort((a, b) => b.costUsd - a.costUsd);
+  if (rows.length <= limit) return rows;
+  const top = rows.slice(0, limit - 1);
+  const rest = rows.slice(limit - 1);
+  const other = { [keyName]: `+${rest.length} more`, isOther: true, tokens: 0, costUsd: 0, turns: 0, liveCostUsd: 0, recoveredCostUsd: 0, estimatedCostUsd: 0 };
+  for (const r of rest) for (const k of ['tokens', 'costUsd', 'turns', 'liveCostUsd', 'recoveredCostUsd', 'estimatedCostUsd']) other[k] += r[k];
+  return [...top, other];
+}
+
+export function finalizeRollup(r) {
+  const { now } = r;
+
+  const dailyChart = [];
+  for (let i = HISTORY_DAYS - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i); // calendar arithmetic, so DST days don't skip or repeat
+    const key = localDayKey(d.getTime());
+    dailyChart.push(chartPoint(r.byDay.get(key), key.slice(5).replace('-', '/'), key));
+  }
+
+  const weeklyChart = [];
+  for (let idx = HISTORY_WEEKS - 1; idx >= 0; idx--) {
+    const key = localDayKey(now - (idx + 1) * 7 * DAY_MS + 1);
+    weeklyChart.push(chartPoint(r.byWeekIdx.get(idx), key.slice(5).replace('-', '/'), key));
+  }
+
+  const monthlyChart = [];
+  const base = new Date(now);
+  for (let i = HISTORY_MONTHS - 1; i >= 0; i--) {
+    const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
+    const key = localMonthKey(d.getTime());
+    monthlyChart.push(chartPoint(r.byMonth.get(key), d.toLocaleString('en-US', { month: 'short' }), key));
+  }
+
+  const periods = {};
+  for (const [k, p] of Object.entries(r.periods)) {
+    periods[k] = { ...publicBucket(p.bucket), byProject: rankedList(p.byProject, 'project'), byModel: rankedList(p.byModel, 'model') };
+  }
+
+  return {
+    totals: publicBucket(r.totals),
+    periods,
+    charts: { daily: dailyChart, weekly: weeklyChart, monthly: monthlyChart },
+    byProject: rankedList(r.byProject, 'project'),
+    byModel: rankedList(r.byModel, 'model'),
+    // Every project, untruncated, for the full-history list.
+    projectTiers: new Map([...r.byProject].map(([p, b]) => [p, { tokens: tokSum(b), live: b.live, recovered: b.recovered, estimated: b.estimated }])),
+  };
+}
+
+// ── Live (transcript) aggregation ───────────────────────────────────────
 
 function emptyNode() {
   return {
     recMs: -Infinity, timestamp: null, project: null, model: null, isSubagent: false,
     agentType: null, agentLabel: null, recentTokens: 0, recentCostUsd: 0,
     recentInput: 0, recentOutput: 0, recentCache: 0, isThinking: false, thinkingSince: null,
-    liveOnly: false,
   };
 }
 
-export function aggregate(records, pendingTurns = []) {
-  const now = Date.now();
-
-  const totals = emptyBucket();
-  const periods = { today: emptyBucket(), week: emptyBucket(), month: emptyBucket(), year: emptyBucket() };
-  const byDay = new Map();
-  const byWeekIdx = new Map();
-  const byMonth = new Map();
-  const byProject = new Map();
-  const byModel = new Map();
-  // Same breakdown as byProject/byModel above, but scoped to each period
-  // window too — feeds the By Project / By Model panels so they follow the
-  // Today/7 Days/30 Days/1 Year switch instead of always showing all-time.
-  const byProjectPeriod = { today: new Map(), week: new Map(), month: new Map(), year: new Map() };
-  const byModelPeriod = { today: new Map(), week: new Map(), month: new Map(), year: new Map() };
+// Folds every live record into `rollup` and returns everything else the
+// report needs from the transcripts: activity pulse nodes, the recent-turn
+// feed, per-session spend (merge.js uses it to measure a real cost per
+// prompt), and per-model usage (to price stats-cache.json's totals the
+// same way live data is priced). `extraEntries` are reconcile.js's
+// additions for spend transcripts don't show; they count toward totals
+// and per-session spend, but not the per-response feed or the pulse.
+export function aggregateLive(rollup, records, pendingTurns = [], extraEntries = []) {
+  const { now } = rollup;
   const sessions = new Set();
   const lastEventByNode = new Map();
+  // ownerSessionId -> { costUsd, tok, byModel: Map(model -> { costUsd, tok }), spend: [{ ms, model, tok, costUsd }] }
+  // Keyed by the owning (main) session, so a session's subagents count as
+  // part of it.
+  const bySession = new Map();
+  const addSessionSpend = (sid, ms, model, tok, cost) => {
+    let s = bySession.get(sid);
+    if (!s) bySession.set(sid, (s = { costUsd: 0, tok: emptyTok(), byModel: new Map(), spend: [] }));
+    s.costUsd += cost;
+    addTok(s.tok, tok);
+    let sm = s.byModel.get(model);
+    if (!sm) s.byModel.set(model, (sm = { costUsd: 0, tok: emptyTok() }));
+    sm.costUsd += cost;
+    addTok(sm.tok, tok);
+    s.spend.push({ ms, model, tok, costUsd: cost });
+  };
+  const usageByModel = new Map(); // model -> { tok, write5m, write1h }
   let lastEventAt = null;
   let firstEventAt = null;
-  // costForUsage returns null for a model string pricing.js doesn't
-  // recognize (no exact match, no family-regex fallback) — those tokens
-  // still count toward every token total above, but contribute $0 to every
-  // cost total, with nothing else here to distinguish "genuinely free" from
-  // "unpriced." Tracked separately so the UI can say so instead of quietly
-  // under-reporting cost.
+  // A model string pricing.js doesn't recognize at all prices to null —
+  // those tokens still count everywhere, but add $0, so they're tracked to
+  // say so in the UI instead of quietly under-reporting cost. Models only
+  // matched by family (a release newer than the price table) are priced at
+  // that family's newest rate and flagged as approximate.
   let unpricedTokens = 0;
   const unpricedModels = new Set();
+  const approxPricedModels = new Set();
 
   const sorted = [...records].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
   for (const rec of sorted) {
-    const tok = breakdown(rec.usage);
+    const tok = usageBreakdown(rec.usage);
+    const total = tokSum(tok);
     const rawCost = costForUsage(rec.model, rec.usage);
-    const cost = rawCost || 0;
-    const recMs = new Date(rec.timestamp).getTime();
-    const ageMs = now - recMs;
-
-    // Records from an oversized transcript (see parseLogs.js) are only the
-    // tail of its history, so counting them in any total would be a
-    // misleading partial number. They still feed the live activity below.
-    if (!rec.liveOnly) {
-      if (rawCost == null) {
-        unpricedTokens += bucketTokens(tok);
-        unpricedModels.add(rec.model || 'unknown');
-      }
-
-      accumulate(totals, tok, cost);
-
-      for (const key of Object.keys(PERIOD_WINDOWS_MS)) {
-        if (ageMs >= 0 && ageMs <= PERIOD_WINDOWS_MS[key]) {
-          accumulate(periods[key], tok, cost);
-          bumpMap(byProjectPeriod[key], rec.project, tok, cost);
-          bumpMap(byModelPeriod[key], rec.model, tok, cost);
-        }
-      }
-
-      bumpMap(byDay, dayKeyOf(rec.timestamp), tok, cost);
-      bumpMap(byMonth, dayKeyOf(rec.timestamp).slice(0, 7), tok, cost);
-      if (ageMs >= 0) {
-        const weekIdx = Math.floor(ageMs / (7 * DAY_MS));
-        if (weekIdx < HISTORY_WEEKS) bumpMap(byWeekIdx, weekIdx, tok, cost);
-      }
-
-      bumpMap(byProject, rec.project, tok, cost);
-      bumpMap(byModel, rec.model, tok, cost);
-
-      if (rec.sessionId) sessions.add(rec.sessionId);
-      if (!firstEventAt || rec.timestamp < firstEventAt) firstEventAt = rec.timestamp;
+    if (rawCost == null) {
+      unpricedTokens += total;
+      unpricedModels.add(rec.model || 'unknown');
+    } else if (!resolveModel(rec.model).exact) {
+      approxPricedModels.add(rec.model);
     }
+    const cost = rawCost || 0;
+    const recMs = Date.parse(rec.timestamp);
+    const model = rec.model || 'unknown';
+
+    addEntry(rollup, { ms: recMs, project: rec.project, model, tier: 'live', tok, costUsd: cost, turns: 1 });
+
+    const sid = rec.ownerSessionId || rec.sessionId;
+    if (sid) {
+      sessions.add(sid);
+      addSessionSpend(sid, recMs, model, tok, cost);
+    }
+
+    let mu = usageByModel.get(model);
+    if (!mu) usageByModel.set(model, (mu = { tok: emptyTok(), write5m: 0, write1h: 0 }));
+    addTok(mu.tok, tok);
+    const split = cacheSplit(rec.usage);
+    mu.write5m += split.write5m;
+    mu.write1h += split.write1h;
 
     // A subagent gets its own node (keyed by agentId) so N subagents
     // running in parallel under one session show as N pulses, not one.
@@ -154,10 +316,7 @@ export function aggregate(records, pendingTurns = []) {
     const nodeKey = rec.agentId || rec.sessionId;
     if (nodeKey) {
       let node = lastEventByNode.get(nodeKey);
-      if (!node) {
-        node = emptyNode();
-        lastEventByNode.set(nodeKey, node);
-      }
+      if (!node) lastEventByNode.set(nodeKey, (node = emptyNode()));
       if (recMs > node.recMs) {
         node.recMs = recMs;
         node.timestamp = rec.timestamp;
@@ -167,13 +326,13 @@ export function aggregate(records, pendingTurns = []) {
         node.agentType = rec.agentType;
         node.agentLabel = rec.agentLabel;
       }
-      if (rec.liveOnly) node.liveOnly = true;
       // Volume for the pulse animation: total throughput for this node
       // within the warm window, not just its single latest turn. Kept
       // split by type too, so the pulse can show input/output/cache as
       // distinct downstream sinks instead of one undifferentiated total.
+      const ageMs = now - recMs;
       if (ageMs >= 0 && ageMs <= WARM_WINDOW_MS) {
-        node.recentTokens += bucketTokens(tok);
+        node.recentTokens += total;
         node.recentCostUsd += cost;
         node.recentInput += tok.input;
         node.recentOutput += tok.output;
@@ -182,23 +341,29 @@ export function aggregate(records, pendingTurns = []) {
     }
 
     if (!lastEventAt || rec.timestamp > lastEventAt) lastEventAt = rec.timestamp;
+    if (!firstEventAt || rec.timestamp < firstEventAt) firstEventAt = rec.timestamp;
+  }
+
+  for (const e of extraEntries) {
+    addEntry(rollup, e);
+    if (e.ownerSessionId) addSessionSpend(e.ownerSessionId, e.ms, e.model, e.tok, e.costUsd);
   }
 
   // Fold in sessions/subagents that are mid-turn right now — prompt or tool
-  // result submitted, no reply logged yet (see parseLogs.js's
-  // collectPendingTurns). Applied after the records above so its recency
-  // always wins: a pending entry only exists when it's the last line in its
-  // file, so by construction it postdates every assistant record already
-  // folded into that same node. This is what makes a brand-new prompt light
-  // the pulse up immediately instead of waiting for its first billed reply.
+  // result submitted, no reply logged yet. Applied after the records above
+  // so its recency always wins: a pending entry only exists when it's the
+  // last turn in its file, so by construction it postdates every assistant
+  // record already folded into that same node. This is what makes a
+  // brand-new prompt light the pulse up immediately instead of waiting for
+  // its first billed reply.
   for (const p of pendingTurns) {
     const nodeKey = p.agentId || p.sessionId;
     if (!nodeKey) continue;
-    const pendingMs = new Date(p.timestamp).getTime();
+    const pendingMs = Date.parse(p.timestamp);
     if (now - pendingMs > THINKING_TIMEOUT_MS) continue;
 
-    const node = lastEventByNode.get(nodeKey) || emptyNode();
-    lastEventByNode.set(nodeKey, node);
+    let node = lastEventByNode.get(nodeKey);
+    if (!node) lastEventByNode.set(nodeKey, (node = emptyNode()));
     node.isThinking = true;
     node.thinkingSince = p.timestamp;
     node.project = node.project || p.project;
@@ -206,45 +371,11 @@ export function aggregate(records, pendingTurns = []) {
     node.agentType = node.agentType || p.agentType;
     node.agentLabel = node.agentLabel || p.agentLabel;
     node.isSubagent = node.isSubagent || Boolean(p.agentId);
-    if (p.liveOnly) node.liveOnly = true;
     if (pendingMs > node.recMs) {
       node.recMs = pendingMs;
       node.timestamp = p.timestamp;
     }
   }
-
-  const dailyChart = [];
-  for (let i = HISTORY_DAYS - 1; i >= 0; i--) {
-    const key = new Date(now - i * DAY_MS).toISOString().slice(0, 10);
-    dailyChart.push(chartPoint(byDay.get(key), key.slice(5).replace('-', '/'), key));
-  }
-
-  const weeklyChart = [];
-  for (let idx = HISTORY_WEEKS - 1; idx >= 0; idx--) {
-    const startMs = now - (idx + 1) * 7 * DAY_MS;
-    const key = new Date(startMs).toISOString().slice(0, 10);
-    weeklyChart.push(chartPoint(byWeekIdx.get(idx), key.slice(5).replace('-', '/'), key));
-  }
-
-  const monthlyChart = [];
-  const base = new Date(now);
-  for (let i = HISTORY_MONTHS - 1; i >= 0; i--) {
-    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() - i, 1));
-    const key = d.toISOString().slice(0, 7);
-    monthlyChart.push(chartPoint(byMonth.get(key), d.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' }), key));
-  }
-
-  const toRankedList = (map, keyName) =>
-    [...map.entries()]
-      .map(([key, bucket]) => ({ [keyName]: key, tokens: bucketTokens(bucket), costUsd: bucket.costUsd, turns: bucket.turns }))
-      .sort((a, b) => b.costUsd - a.costUsd)
-      .slice(0, TOP_N);
-
-  const periodResult = (bucket, projectMap, modelMap) => ({
-    ...withTokens(bucket),
-    byProject: toRankedList(projectMap, 'project'),
-    byModel: toRankedList(modelMap, 'model'),
-  });
 
   const recent = sorted
     .slice(-RECENT_N)
@@ -253,9 +384,8 @@ export function aggregate(records, pendingTurns = []) {
       timestamp: rec.timestamp,
       project: rec.project,
       model: rec.model,
-      tokens: bucketTokens(breakdown(rec.usage)),
+      tokens: tokSum(usageBreakdown(rec.usage)),
       costUsd: costForUsage(rec.model, rec.usage),
-      liveOnly: Boolean(rec.liveOnly),
     }));
 
   // Every session or subagent whose most recent turn landed within
@@ -280,25 +410,26 @@ export function aggregate(records, pendingTurns = []) {
       cache: s.recentCache,
       isThinking: s.isThinking,
       thinkingSince: s.thinkingSince,
-      liveOnly: s.liveOnly,
     }))
     .filter((n) => n.msAgo >= 0 && n.msAgo <= WARM_WINDOW_MS);
 
   return {
-    generatedAt: new Date(now).toISOString(),
     lastEventAt,
     firstEventAt,
-    totals: { ...withTokens(totals), sessions: sessions.size, unpricedTokens, unpricedModels: [...unpricedModels] },
-    periods: {
-      today: periodResult(periods.today, byProjectPeriod.today, byModelPeriod.today),
-      week: periodResult(periods.week, byProjectPeriod.week, byModelPeriod.week),
-      month: periodResult(periods.month, byProjectPeriod.month, byModelPeriod.month),
-      year: periodResult(periods.year, byProjectPeriod.year, byModelPeriod.year),
-    },
-    charts: { daily: dailyChart, weekly: weeklyChart, monthly: monthlyChart },
-    byProject: toRankedList(byProject, 'project'),
-    byModel: toRankedList(byModel, 'model'),
+    sessions: sessions.size,
+    bySession,
+    usageByModel,
+    unpricedTokens,
+    unpricedModels: [...unpricedModels],
+    approxPricedModels: [...approxPricedModels],
     recent,
     network: { nodes: networkNodes, liveWindowMs: LIVE_WINDOW_MS, warmWindowMs: WARM_WINDOW_MS },
   };
+}
+
+function addTok(into, t) {
+  into.input += t.input;
+  into.output += t.output;
+  into.cacheWrite += t.cacheWrite;
+  into.cacheRead += t.cacheRead;
 }

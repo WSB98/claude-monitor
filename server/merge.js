@@ -1,256 +1,282 @@
-// Blends Claude Code's own historical records (server/history.js) into the
-// live aggregate (server/aggregate.js). Three tiers, in order of
-// decreasing confidence — a prompt is classified into exactly one:
+// Builds the full report: exact live spend from transcripts (aggregate.js),
+// plus Claude Code's own historical records (history.js) for whatever the
+// transcripts no longer cover. Three tiers, in order of decreasing
+// confidence; every prompt in history.jsonl lands in exactly one:
 //
-//  - "live": exact, straight from the JSONL scan (server/parseLogs.js).
-//  - "recovered": stats-cache.json's real day×model token counts
-//    (server/history.js), each priced through that model's own real
-//    lifetime rate — a real dollar figure per day, not a window-wide
-//    blend. Split across projects using THAT day's real prompt mix from
-//    history.jsonl (a day-level join), falling back to the whole
-//    recovered window's project mix only for a day stats-cache has data
-//    for but history.jsonl doesn't (the two files can have different
-//    retention). Days at/after the live scan's earliest surviving event
-//    are excluded entirely so a transcript that outlives stats-cache's
-//    last computation, or a stats-cache recomputed later than a
-//    transcript's retention window, never gets counted on both sides.
-//  - "estimated": everything else — prompts with no real dollar pool to
-//    draw from at all, because Claude Code had already deleted that usage
-//    data before this tool ever ran. Priced per-project using that
-//    project's OWN blended $/prompt rate from its live+recovered history
-//    when it has any, falling back to a global blended rate (built from
-//    every live+recovered prompt) only for a project with zero known cost
-//    anywhere. Still the roughest tier — it assumes a typical prompt in
-//    that project cost about the same throughout — but it no longer
-//    assumes every project's prompts cost the same as every other
-//    project's, the way a single global rate would.
+//  - "live": its session still has a transcript on disk, so its cost is
+//    already counted response by response — plus whatever Claude Code's
+//    own cost-state totals show the transcript missed (reconcile.js).
+//  - "recovered": its session's transcript is gone, but Claude Code kept
+//    its own record of that session's usage (~/.claude.json, see
+//    history.js readReportedSessions) — exact token totals, spread over
+//    the session's prompts. Or: its session's transcript is gone, but stats-cache.json
+//    (Claude Code's own per-day token totals) covers its day. That day's
+//    total is split across that day's uncovered prompts in proportion to
+//    what each is expected to cost (see estimate.js). Only days
+//    before the first surviving transcript event are used, so it never
+//    overlaps live data (its days are UTC dates). stats-cache counts
+//    every transcript line, so it carries the same per-content-block
+//    duplication parseLogs.js removes; it's corrected with the duplication
+//    ratio measured on live transcripts, per model and token type.
+//  - "estimated": no surviving data at all (deleted session, outside the
+//    stats-cache window). Priced by estimate.js's per-prompt model, fitted
+//    on every surviving session that also has history.jsonl prompts: cost
+//    by the prompt's position within its session, scaled by its project's
+//    measured intensity. Sessions with no history.jsonl prompts at all
+//    (e.g. ones started from an app or SDK rather than the CLI) can't be
+//    split into prompts, so they don't feed the model.
+//    Also estimated: reconcile.js's modeled correction for responses no
+//    cost-state snapshot covers.
 //
-// The same per-tier totals feed both the overall
-// `totals`/`periods.year`/`charts.monthly` numbers and the per-project
-// breakdown in `allProjectsHistory`, so the sum across every project always
-// reconciles exactly with the top-level totals — nothing is invented in
-// one place and left out of the other.
+// All three tiers feed the same rollup (aggregate.js), so the all-time
+// totals, the period cards, By Project / By Model, every chart, and the
+// full-history project list are all slices of one set of numbers and
+// reconcile exactly.
 
+import { createRollup, addEntry, finalizeRollup, aggregateLive } from './aggregate.js';
+import { costFromBreakdown } from './pricing.js';
 import { summarizeProjectHistory } from './history.js';
+import { reconcile } from './reconcile.js';
+import { buildPromptModel } from './estimate.js';
 
-const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+const TOK_KEYS = ['input', 'output', 'cacheWrite', 'cacheRead'];
+const ONE = { input: 1, output: 1, cacheWrite: 1, cacheRead: 1 };
 
-export function mergeHistorical(liveResult, recoveredStats, promptHistory) {
-  if (!recoveredStats && !promptHistory?.length) {
-    return { ...liveResult, dataSources: emptyDataSources(liveResult), allProjectsHistory: [] };
-  }
+const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+const tokSum = (t) => t.input + t.output + t.cacheWrite + t.cacheRead;
+const scaleTok = (t, f) => ({ input: t.input * f, output: t.output * f, cacheWrite: t.cacheWrite * f, cacheRead: t.cacheRead * f });
 
-  const liveFirstMs = liveResult.firstEventAt ? new Date(liveResult.firstEventAt).getTime() : Infinity;
-  const nowMs = Date.now();
-
-  const monthly = liveResult.charts.monthly.map((pt) => ({ ...pt }));
-  const monthByKey = new Map(monthly.map((pt) => [pt.key, pt]));
-
-  // ── Single pass over promptHistory: classify every prompt into live /
-  // recovered / estimated, tallying whatever each tier needs, PLUS a
-  // day-level project breakdown (independent of tier) used below to split
-  // each recovered day's real dollar figure by project. ──
-  const recoveredStartMs = recoveredStats?.firstSessionDate ? new Date(recoveredStats.firstSessionDate).getTime() : null;
-  const recoveredEndMs = recoveredStats?.lastComputedDate ? new Date(recoveredStats.lastComputedDate).getTime() : null;
-
-  let liveWindowPromptCount = 0;
-  let recoveredWindowPromptCount = 0;
-  let estimatedPromptCount = 0;
-  let estimatedYearPromptCount = 0;
-  const liveCountsByProject = new Map();
-  const recoveredCountsByProject = new Map();
-  const estimatedCountsByProject = new Map();
-  const estimatedCountsByMonth = new Map();
-  const promptCountByDay = new Map(); // dayKey -> total prompts that day, any project
-  const projectCountsByDay = new Map(); // dayKey -> Map(project -> count)
-
-  for (const p of promptHistory) {
-    const ms = new Date(p.timestamp).getTime();
-    const dayKey = p.timestamp.slice(0, 10);
-    promptCountByDay.set(dayKey, (promptCountByDay.get(dayKey) || 0) + 1);
-    const dayProjects = projectCountsByDay.get(dayKey) || new Map();
-    dayProjects.set(p.project, (dayProjects.get(p.project) || 0) + 1);
-    projectCountsByDay.set(dayKey, dayProjects);
-
-    if (ms >= liveFirstMs) {
-      liveWindowPromptCount += 1;
-      liveCountsByProject.set(p.project, (liveCountsByProject.get(p.project) || 0) + 1);
-    } else if (recoveredStartMs != null && ms >= recoveredStartMs && ms < recoveredEndMs) {
-      recoveredWindowPromptCount += 1;
-      recoveredCountsByProject.set(p.project, (recoveredCountsByProject.get(p.project) || 0) + 1);
-    } else {
-      estimatedPromptCount += 1;
-      estimatedCountsByProject.set(p.project, (estimatedCountsByProject.get(p.project) || 0) + 1);
-      const monthKey = p.timestamp.slice(0, 7);
-      estimatedCountsByMonth.set(monthKey, (estimatedCountsByMonth.get(monthKey) || 0) + 1);
-      if (nowMs - ms <= YEAR_MS) estimatedYearPromptCount += 1;
+// Token-weighted average of the per-model duplication ratios — used for a
+// stats-cache model that has no live transcripts to measure its own.
+function overallDuplication(duplicationByModel, usageByModel) {
+  const num = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const den = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  for (const [model, r] of duplicationByModel) {
+    const u = usageByModel.get(model)?.tok;
+    if (!u) continue;
+    for (const k of TOK_KEYS) {
+      if (!r[k]) continue;
+      num[k] += u[k]; // deduplicated
+      den[k] += u[k] / r[k]; // raw
     }
   }
+  const out = {};
+  for (const k of TOK_KEYS) out[k] = den[k] ? num[k] / den[k] : 1;
+  return out;
+}
 
-  // ── Tier "recovered": stats-cache.json's real per-day cost (already
-  // priced per-model in server/history.js) redistributed across projects
-  // using that same day's real prompt mix. ──
-  let recoveredTokens = 0;
-  let recoveredCostUsd = 0;
-  let yearShareRecoveredTokens = 0;
-  let yearShareRecoveredCostUsd = 0;
-  const recoveredCostByProject = new Map();
-
-  if (recoveredStats) {
-    for (const day of recoveredStats.dailyTokens) {
-      const dayMs = new Date(day.date).getTime();
-      if (dayMs >= liveFirstMs) continue; // already covered, more accurately, by the live scan
-
-      recoveredTokens += day.tokens;
-      recoveredCostUsd += day.costUsd;
-
-      const monthPt = monthByKey.get(day.date.slice(0, 7));
-      if (monthPt) {
-        monthPt.recovered = (monthPt.recovered || 0) + day.tokens;
-        monthPt.costUsd = (monthPt.costUsd || 0) + day.costUsd;
-      }
-      if (nowMs - dayMs <= YEAR_MS) {
-        yearShareRecoveredTokens += day.tokens;
-        yearShareRecoveredCostUsd += day.costUsd;
-      }
-
-      const dayProjects = projectCountsByDay.get(day.date);
-      const dayPromptTotal = promptCountByDay.get(day.date) || 0;
-      if (dayProjects && dayPromptTotal > 0) {
-        for (const [project, count] of dayProjects) {
-          recoveredCostByProject.set(project, (recoveredCostByProject.get(project) || 0) + day.costUsd * (count / dayPromptTotal));
-        }
-      } else if (recoveredWindowPromptCount > 0) {
-        // history.jsonl has nothing for this specific day (retention gap
-        // between the two files) — fall back to each project's share of
-        // the whole recovered window instead of dropping the day's dollars.
-        for (const [project, count] of recoveredCountsByProject) {
-          recoveredCostByProject.set(project, (recoveredCostByProject.get(project) || 0) + day.costUsd * (count / recoveredWindowPromptCount));
-        }
-      }
-    }
+// Prices each stats-cache model's whole-window totals the way live data is
+// priced, after removing line duplication. stats-cache doesn't split cache
+// writes by TTL, so the 1-hour share measured on that model's live data is
+// used (all 5-minute if there's none). Haiku 5.5's per-request long-prompt
+// tier can't be decided from an aggregate, so base rates apply there.
+function priceRecoveredModels(stats, duplicationByModel, usageByModel) {
+  const overall = overallDuplication(duplicationByModel, usageByModel);
+  let liveW5 = 0;
+  let liveW1 = 0;
+  for (const u of usageByModel.values()) {
+    liveW5 += u.write5m;
+    liveW1 += u.write1h;
   }
-
-  // ── Tier "estimated": blended rate (per-project below, globally here as
-  // its fallback), applied to whatever fell outside both real windows. ──
-  const knownCostUsd = (liveResult.totals.costUsd || 0) + recoveredCostUsd;
-  const knownTokens = (liveResult.totals.tokens || 0) + recoveredTokens;
-  const knownPromptCount = liveWindowPromptCount + recoveredWindowPromptCount;
-  const avgCostPerPrompt = knownPromptCount > 0 ? knownCostUsd / knownPromptCount : 0;
-  const avgTokensPerPrompt = knownPromptCount > 0 ? knownTokens / knownPromptCount : 0;
-
-  // estimatedCostUsd itself is NOT `estimatedPromptCount * avgCostPerPrompt`
-  // here — it's accumulated below from each project's own rate, so the
-  // global total is the literal sum of the per-project figures rather than
-  // two independently-computed numbers that could disagree. estimatedTokens
-  // stays global-rate-based since no per-project token breakdown is ever
-  // surfaced for it to need to reconcile against.
-  const estimatedTokens = estimatedPromptCount * avgTokensPerPrompt;
-  const yearShareEstimatedTokens = estimatedYearPromptCount * avgTokensPerPrompt;
-  const yearShareEstimatedCostUsd = estimatedYearPromptCount * avgCostPerPrompt;
-
-  for (const [monthKey, count] of estimatedCountsByMonth) {
-    const pt = monthByKey.get(monthKey);
-    if (!pt) continue;
-    pt.estimated = (pt.estimated || 0) + count * avgTokensPerPrompt;
-    pt.costUsd = (pt.costUsd || 0) + count * avgCostPerPrompt;
-    pt.gapTurns = (pt.gapTurns || 0) + count;
-  }
-
-  let gapRange = null;
-  if (recoveredEndMs != null && liveFirstMs !== Infinity && liveFirstMs > recoveredEndMs) {
-    gapRange = [recoveredStats.lastComputedDate, liveResult.firstEventAt];
-  }
-
-  const candidateFirsts = [liveResult.firstEventAt, recoveredStats?.firstSessionDate, earliest(promptHistory)].filter(Boolean);
-  const firstEventAt = candidateFirsts.length
-    ? new Date(Math.min(...candidateFirsts.map((d) => new Date(d).getTime()))).toISOString()
-    : liveResult.firstEventAt;
-
-  // ── Per-project totals — same tiers, same pools as above, so the sum
-  // across every project reconciles exactly with the totals below. ──
-  const liveCostByProject = new Map(liveResult.byProject.map((p) => [p.project, p.costUsd]));
-  const allProjects = new Set([...liveCostByProject.keys(), ...recoveredCountsByProject.keys(), ...estimatedCountsByProject.keys()]);
-  const projectCosts = new Map();
-  let estimatedCostUsd = 0;
-  for (const project of allProjects) {
-    const liveCostUsd = liveCostByProject.get(project) || 0;
-    const projRecoveredCostUsd = recoveredCostByProject.get(project) || 0;
-
-    // A project's own blended $/prompt from its real (live+recovered)
-    // history — falls back to the global blend only when this project has
-    // no known cost anywhere, so one project's typical prompt cost never
-    // gets assumed for another's.
-    const projKnownCostUsd = liveCostUsd + projRecoveredCostUsd;
-    const projKnownPromptCount = (liveCountsByProject.get(project) || 0) + (recoveredCountsByProject.get(project) || 0);
-    const projAvgCostPerPrompt = projKnownPromptCount > 0 ? projKnownCostUsd / projKnownPromptCount : avgCostPerPrompt;
-    const projEstimatedCostUsd = (estimatedCountsByProject.get(project) || 0) * projAvgCostPerPrompt;
-    estimatedCostUsd += projEstimatedCostUsd;
-
-    projectCosts.set(project, {
-      liveCostUsd,
-      recoveredCostUsd: projRecoveredCostUsd,
-      estimatedCostUsd: projEstimatedCostUsd,
-      totalCostUsd: liveCostUsd + projRecoveredCostUsd + projEstimatedCostUsd,
+  const out = new Map();
+  for (const [model, m] of Object.entries(stats.models)) {
+    const r = duplicationByModel.get(model) || overall || ONE;
+    const tok = { input: m.input * r.input, output: m.output * r.output, cacheWrite: m.cacheWrite * r.cacheWrite, cacheRead: m.cacheRead * r.cacheRead };
+    const u = usageByModel.get(model);
+    const w5 = u ? u.write5m : liveW5;
+    const w1 = u ? u.write1h : liveW1;
+    const share1h = w5 + w1 > 0 ? w1 / (w5 + w1) : 0;
+    const costUsd = costFromBreakdown(model, {
+      input: tok.input,
+      output: tok.output,
+      cacheWrite5m: tok.cacheWrite * (1 - share1h),
+      cacheWrite1h: tok.cacheWrite * share1h,
+      cacheRead: tok.cacheRead,
+      webSearches: m.webSearches,
+      perRequest: false,
     });
+    // input+output across all its days, to apportion the totals by day
+    const dayBasis = stats.days.reduce((a, d) => a + (d.tokensByModel[model] || 0), 0);
+    out.set(model, { tok, costUsd, priced: costUsd != null, dayBasis });
+  }
+  return out;
+}
+
+export function buildReport({ records, pendingTurns, transcriptSessionIds, duplicationByModel = new Map(), snapshots = [], recoveredStats, promptHistory = [], reportedSessions = [] }) {
+  const rollup = createRollup();
+  const recon = reconcile(records, snapshots);
+  const live = aggregateLive(rollup, records, pendingTurns, recon.entries);
+  const promptModel = buildPromptModel(live.bySession, promptHistory);
+  const predictPrompt = (p) => (promptModel ? promptModel.predict(p) : []);
+
+  // ── Deleted sessions Claude Code recorded itself: exact usage, recovered.
+  // Each is spread over its own prompts by their expected cost, and also
+  // becomes a calibration point for what spending looked like back then. ──
+  const promptsBySessionId = new Map();
+  for (const p of promptHistory) {
+    if (!p.sessionId) continue;
+    if (!promptsBySessionId.has(p.sessionId)) promptsBySessionId.set(p.sessionId, []);
+    promptsBySessionId.get(p.sessionId).push(p);
+  }
+  const reportedPrompts = new Set();
+  let reportedSessionCount = 0;
+  let reportedCostUsd = 0;
+  for (const rs of reportedSessions) {
+    if (transcriptSessionIds.has(rs.sessionId) || live.bySession.has(rs.sessionId)) continue; // counted exactly already
+    const prompts = (promptsBySessionId.get(rs.sessionId) || []).sort((a, b) => a.ms - b.ms);
+    if (!prompts.length) continue; // nothing to place it in time with
+    let sessionCost = 0;
+    const weights = prompts.map((p) => (promptModel ? promptModel.baseCost(p) : 1));
+    const wSum = weights.reduce((a, w) => a + w, 0);
+    for (const [rawModel, t] of Object.entries(rs.models)) {
+      const model = rawModel.replace(/\[[^\]]*\]$/, '');
+      // No TTL split is recorded; these predate the transcripts on disk,
+      // when the 5-minute cache was the norm.
+      const costUsd = costFromBreakdown(model, { input: t.input, output: t.output, cacheRead: t.cacheRead, cacheWrite5m: t.cacheWrite, webSearches: t.webSearches, perRequest: false });
+      if (costUsd == null) unpricedModels.add(model);
+      const tok = { input: t.input, output: t.output, cacheWrite: t.cacheWrite, cacheRead: t.cacheRead };
+      prompts.forEach((p, i) => {
+        const share = wSum > 0 ? weights[i] / wSum : 1 / prompts.length;
+        addEntry(rollup, { ms: p.ms, project: p.project, model, tier: 'recovered', tok: scaleTok(tok, share), costUsd: (costUsd || 0) * share, turns: 0 });
+      });
+      sessionCost += costUsd || 0;
+    }
+    for (const p of prompts) reportedPrompts.add(p);
+    if (promptModel) promptModel.addCalibration(prompts, sessionCost);
+    reportedSessionCount += 1;
+    reportedCostUsd += sessionCost;
+  }
+  const liveFirstMs = live.firstEventAt ? Date.parse(live.firstEventAt) : Infinity;
+  const liveFirstDay = Number.isFinite(liveFirstMs) ? utcDay(liveFirstMs) : null;
+  const unpricedModels = new Set(live.unpricedModels);
+
+  // ── Classify every prompt. A prompt without a session id (very old
+  // history lines) falls back to time: covered if it's after the first
+  // surviving transcript event. ──
+  const isCovered = (p) => (p.sessionId ? transcriptSessionIds.has(p.sessionId) || live.bySession.has(p.sessionId) : p.ms >= liveFirstMs);
+
+  // ── Recovered: stats-cache days strictly before any live data. ──
+  const recoveredByDay = new Map(); // UTC date -> Map(model -> { tok, costUsd })
+  if (recoveredStats) {
+    const priced = priceRecoveredModels(recoveredStats, duplicationByModel, live.usageByModel);
+    for (const day of recoveredStats.days) {
+      if (liveFirstDay && day.date >= liveFirstDay) continue; // live data is exact from here on
+      const byModel = new Map();
+      for (const [model, dayTokens] of Object.entries(day.tokensByModel)) {
+        const pm = priced.get(model);
+        if (!pm || !pm.dayBasis || !dayTokens) continue;
+        if (!pm.priced) unpricedModels.add(model);
+        const share = dayTokens / pm.dayBasis;
+        byModel.set(model, { tok: scaleTok(pm.tok, share), costUsd: (pm.costUsd || 0) * share });
+      }
+      if (byModel.size) recoveredByDay.set(day.date, byModel);
+    }
   }
 
-  // A project can have live cost with zero history.jsonl entries (e.g. a
-  // cwd that only ever showed up mid-session, never as a prompt's own
-  // project) — summarizeProjectHistory alone would silently drop it and
-  // break the reconciliation with totals above, so any such project gets
-  // a stub row here instead.
-  const historyRows = summarizeProjectHistory(promptHistory);
-  const coveredProjects = new Set(historyRows.map((r) => r.project));
-  const liveOnlyRows = [...liveCostByProject.keys()]
-    .filter((project) => !coveredProjects.has(project))
-    .map((project) => ({ project, turns: 0, firstSeen: null, lastSeen: null }));
+  const recoveredPromptsByDay = new Map();
+  const estimatedPrompts = [];
+  for (const p of promptHistory) {
+    if (isCovered(p) || reportedPrompts.has(p)) continue;
+    const day = utcDay(p.ms);
+    if (recoveredByDay.has(day)) {
+      if (!recoveredPromptsByDay.has(day)) recoveredPromptsByDay.set(day, []);
+      recoveredPromptsByDay.get(day).push(p);
+    } else {
+      estimatedPrompts.push(p);
+    }
+  }
 
-  const allProjectsHistory = [...historyRows, ...liveOnlyRows]
-    .map((row) => ({
-      ...row,
-      ...(projectCosts.get(row.project) || { liveCostUsd: 0, recoveredCostUsd: 0, estimatedCostUsd: 0, totalCostUsd: 0 }),
-    }))
+  // Recovered entries: each day's total split across that day's uncovered
+  // prompts by their expected cost (keeping their real time and project).
+  // A day with spend but no uncovered prompt keeps its spend, unattributed.
+  let recoveredPromptCount = reportedPrompts.size;
+  for (const [day, byModel] of recoveredByDay) {
+    const prompts = recoveredPromptsByDay.get(day) || [];
+    const slots = prompts.length ? prompts : [{ ms: Date.parse(`${day}T12:00:00Z`), project: 'unattributed' }];
+    const weights = slots.map((slot) => (prompts.length ? predictPrompt(slot).reduce((a, r) => a + r.costUsd, 0) : 1));
+    const wSum = weights.reduce((a, w) => a + w, 0);
+    for (const [model, m] of byModel) {
+      slots.forEach((slot, i) => {
+        const share = wSum > 0 ? weights[i] / wSum : 1 / slots.length;
+        addEntry(rollup, { ms: slot.ms, project: slot.project, model, tier: 'recovered', tok: scaleTok(m.tok, share), costUsd: m.costUsd * share, turns: 0 });
+      });
+    }
+    recoveredPromptCount += prompts.length;
+  }
+
+  // Estimated entries: every uncovered prompt at its own predicted cost.
+  let promptEstimateCostUsd = 0;
+  let promptEstimateTokens = 0;
+  for (const p of estimatedPrompts) {
+    for (const r of predictPrompt(p)) {
+      addEntry(rollup, { ms: p.ms, project: p.project, model: r.model, tier: 'estimated', tok: r.tok, costUsd: r.costUsd, turns: 0 });
+      promptEstimateCostUsd += r.costUsd;
+      promptEstimateTokens += tokSum(r.tok);
+    }
+  }
+
+  const fin = finalizeRollup(rollup);
+
+  // ── Full-history project list: every project with a prompt or any spend,
+  // its tier split straight from the rollup. ──
+  const historyRows = summarizeProjectHistory(promptHistory);
+  const covered = new Set(historyRows.map((r) => r.project));
+  const stubRows = [...fin.projectTiers.keys()]
+    .filter((project) => !covered.has(project))
+    .map((project) => ({ project, turns: 0, firstSeen: null, lastSeen: null }));
+  const allProjectsHistory = [...historyRows, ...stubRows]
+    .map((row) => {
+      const t = fin.projectTiers.get(row.project);
+      const liveCostUsd = t?.live.costUsd || 0;
+      const recoveredCostUsd = t?.recovered.costUsd || 0;
+      const estimatedCostUsd = t?.estimated.costUsd || 0;
+      return { ...row, liveCostUsd, recoveredCostUsd, estimatedCostUsd, totalCostUsd: liveCostUsd + recoveredCostUsd + estimatedCostUsd };
+    })
     .sort((a, b) => b.totalCostUsd - a.totalCostUsd);
 
+  const recoveredDays = [...recoveredByDay.keys()].sort();
+  const firstCandidates = [
+    Number.isFinite(liveFirstMs) ? liveFirstMs : null,
+    recoveredDays.length ? Date.parse(`${recoveredDays[0]}T00:00:00Z`) : null,
+    promptHistory.length ? Math.min(...promptHistory.map((p) => p.ms)) : null,
+  ].filter((v) => v != null);
+
   return {
-    ...liveResult,
-    firstEventAt,
+    generatedAt: new Date(rollup.now).toISOString(),
+    lastEventAt: live.lastEventAt,
+    firstEventAt: firstCandidates.length ? new Date(Math.min(...firstCandidates)).toISOString() : null,
     totals: {
-      ...liveResult.totals,
-      liveTokens: liveResult.totals.tokens,
-      liveCostUsd: liveResult.totals.costUsd,
-      recoveredTokens,
-      recoveredCostUsd,
-      estimatedTokens,
-      estimatedCostUsd,
-      tokens: liveResult.totals.tokens + recoveredTokens + estimatedTokens,
-      costUsd: liveResult.totals.costUsd + recoveredCostUsd + estimatedCostUsd,
+      ...fin.totals,
+      sessions: live.sessions,
+      unpricedTokens: live.unpricedTokens,
+      unpricedModels: [...unpricedModels],
+      approxPricedModels: live.approxPricedModels,
     },
-    periods: {
-      ...liveResult.periods,
-      year: {
-        ...liveResult.periods.year,
-        tokens: liveResult.periods.year.tokens + yearShareRecoveredTokens + yearShareEstimatedTokens,
-        costUsd: liveResult.periods.year.costUsd + yearShareRecoveredCostUsd + yearShareEstimatedCostUsd,
-      },
-    },
-    charts: { ...liveResult.charts, monthly },
+    periods: fin.periods,
+    charts: fin.charts,
+    byProject: fin.byProject,
+    byModel: fin.byModel,
+    recent: live.recent,
+    network: live.network,
     dataSources: {
-      liveSince: liveResult.firstEventAt,
-      recoveredRange: recoveredStats ? [recoveredStats.firstSessionDate, recoveredStats.lastComputedDate] : null,
-      gapRange,
-      gapTurns: estimatedPromptCount,
+      liveSince: live.firstEventAt,
+      recoveredRange: recoveredDays.length ? [recoveredDays[0], recoveredDays[recoveredDays.length - 1]] : null,
+      recoveredTurns: recoveredPromptCount,
+      gapTurns: estimatedPrompts.length,
+      // Uncovered prompts after live data begins: sessions whose
+      // transcripts were deleted while others from that time survived.
+      deletedSessionTurns: estimatedPrompts.filter((p) => p.ms >= liveFirstMs).length,
+      // How the non-exact parts were derived, for the UI's notes.
+      promptEstimate: {
+        costUsd: promptEstimateCostUsd,
+        tokens: promptEstimateTokens,
+        avgCostPerPrompt: estimatedPrompts.length ? promptEstimateCostUsd / estimatedPrompts.length : 0,
+        range: promptModel ? promptModel.costRange(estimatedPrompts) : null,
+        model: promptModel?.stats() || null,
+      },
+      reconciliation: recon.stats,
+      reportedSessions: { sessions: reportedSessionCount, prompts: reportedPrompts.size, costUsd: reportedCostUsd },
     },
     allProjectsHistory,
   };
-}
-
-function earliest(promptHistory) {
-  if (!promptHistory?.length) return null;
-  return promptHistory.reduce((min, p) => (p.timestamp < min ? p.timestamp : min), promptHistory[0].timestamp);
-}
-
-function emptyDataSources(liveResult) {
-  return { liveSince: liveResult.firstEventAt, recoveredRange: null, gapRange: null, gapTurns: 0 };
 }
