@@ -54,31 +54,48 @@ export function readRecoveredStats() {
   }
   if (!data.modelUsage || !data.dailyModelTokens) return null;
 
+  // Each model's own effective $/token, derived from its real lifetime
+  // input/output/cache mix — used below to price dailyModelTokens' per-day
+  // per-model counts individually instead of applying one rate blended
+  // across every model to every day. blendedRate is only a fallback for a
+  // model dailyModelTokens mentions but modelUsage doesn't (shouldn't
+  // happen, but keeps a stray model from silently pricing at $0).
   let totalTokens = 0;
   let totalCostUsd = 0;
+  const ratePerToken = new Map();
   for (const [model, m] of Object.entries(data.modelUsage)) {
     const tokens = (m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadInputTokens || 0) + (m.cacheCreationInputTokens || 0);
     if (tokens === 0) continue;
+    const cost = statsCacheModelCost(model, m);
     totalTokens += tokens;
-    totalCostUsd += statsCacheModelCost(model, m);
+    totalCostUsd += cost;
+    ratePerToken.set(model, cost / tokens);
   }
   if (totalTokens === 0) return null;
+  const blendedRate = totalCostUsd / totalTokens;
 
-  // Daily entries are a blended cross-model token count with no per-day
-  // cost split — used only as a relative weight to spread the accurate
-  // lifetime total across the days/months it actually spans.
+  // dailyModelTokens carries a real day×model join — unlike the lifetime
+  // modelUsage total above, which only has a model dimension, not a daily
+  // one. Pricing each day through the models that actually ran that day,
+  // rather than one blended rate for every day, means a day that skewed
+  // toward a pricier model correctly costs more than one with the same
+  // token count on a cheaper model.
   const dailyTokens = data.dailyModelTokens
-    .map((d) => ({ date: d.date, tokens: Object.values(d.tokensByModel).reduce((a, b) => a + b, 0) }))
+    .map((d) => {
+      let tokens = 0;
+      let costUsd = 0;
+      for (const [model, modelTokens] of Object.entries(d.tokensByModel)) {
+        tokens += modelTokens;
+        costUsd += modelTokens * (ratePerToken.get(model) ?? blendedRate);
+      }
+      return { date: d.date, tokens, costUsd };
+    })
     .filter((d) => d.tokens > 0);
-  const dailyTokenSum = dailyTokens.reduce((a, d) => a + d.tokens, 0) || 1;
 
   return {
     firstSessionDate: data.firstSessionDate || null,
     lastComputedDate: data.lastComputedDate || null,
-    totalTokens,
-    totalCostUsd,
     dailyTokens,
-    dailyTokenSum,
   };
 }
 

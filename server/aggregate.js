@@ -5,7 +5,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const HISTORY_DAYS = 14;
 const HISTORY_WEEKS = 12;
 const HISTORY_MONTHS = 12;
-const TOP_N = 8;
+const TOP_N = 20;
 const RECENT_N = 25;
 
 // "Currently happening" per the ask: a turn that landed in the last 30s.

@@ -1,5 +1,7 @@
 # Claude Monitor
 
+![Demo Image](demo.png)
+
 A local dashboard for [Claude Code](https://claude.com/product/claude-code) token usage and cost. It reads the JSONL transcripts and stats files Claude Code already keeps under `~/.claude` on your machine, aggregates them, and serves a live dashboard — turns, tokens, estimated cost, per-project and per-model breakdowns, and a real-time "activity pulse" view of sessions/subagents as they run.
 
 All usage data stays local — read-only, localhost-only, nothing about your usage is ever uploaded anywhere. The one outbound network call is a Google Fonts import for the display type (`public/index.html`); see [How it works](#how-it-works) if you want to swap that out or remove it.
