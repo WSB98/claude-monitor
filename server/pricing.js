@@ -4,6 +4,16 @@ import { cacheSplit } from './usage.js';
 // against platform.claude.com/docs/en/about-claude/pricing on 2026-11-11 —
 // re-check there if numbers look stale.
 //
+// Usage is always priced at what it cost when it happened. Every logged
+// response names its exact model version, and each version has had one
+// list price for its whole life, so pricing by model id is pricing at the
+// time of use. The one announced change — Sonnet 5's introductory $2/$10
+// rising to $3/$15 on 2026-09-01 — was cancelled before it took effect, so
+// Sonnet 5 is $2/$10 throughout (Claude Code's own /cost still uses $3/$15).
+// If a model's price ever does change mid-life, it needs a dated entry here.
+// Estimates for periods with no logs are priced at the models in use then
+// (see estimate.js), not at today's models.
+//
 // Per model:
 //  - input / output: base rates.
 //  - cacheRead: multiplier on the input rate for cache hits. 0.1x is the

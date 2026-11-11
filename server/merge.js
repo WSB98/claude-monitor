@@ -43,6 +43,22 @@ const TOK_KEYS = ['input', 'output', 'cacheWrite', 'cacheRead'];
 const ONE = { input: 1, output: 1, cacheWrite: 1, cacheRead: 1 };
 
 const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+function modelsByMonth(prompts, promptModel) {
+  const months = new Map();
+  for (const p of prompts) {
+    const key = new Date(p.ms).toISOString().slice(0, 7);
+    if (!months.has(key)) months.set(key, { month: key, prompts: 0, ms: p.ms });
+    months.get(key).prompts += 1;
+  }
+  return [...months.values()]
+    .sort((a, b) => a.month.localeCompare(b.month))
+    .map((m) => ({
+      month: m.month,
+      prompts: m.prompts,
+      models: promptModel.mixAt(Date.parse(`${m.month}-15T12:00:00Z`)).shares.map((x) => ({ model: x.model, share: Math.round(x.share * 1000) / 1000 })),
+    }));
+}
 const tokSum = (t) => t.input + t.output + t.cacheWrite + t.cacheRead;
 const scaleTok = (t, f) => ({ input: t.input * f, output: t.output * f, cacheWrite: t.cacheWrite * f, cacheRead: t.cacheRead * f });
 
@@ -106,7 +122,13 @@ export function buildReport({ records, pendingTurns, transcriptSessionIds, dupli
   const rollup = createRollup();
   const recon = reconcile(records, snapshots);
   const live = aggregateLive(rollup, records, pendingTurns, recon.entries);
-  const promptModel = buildPromptModel(live.bySession, promptHistory);
+  let liveW5 = 0;
+  let liveW1 = 0;
+  for (const u of live.usageByModel.values()) {
+    liveW5 += u.write5m;
+    liveW1 += u.write1h;
+  }
+  const promptModel = buildPromptModel(live.bySession, promptHistory, { liveShare1h: liveW5 + liveW1 > 0 ? liveW1 / (liveW5 + liveW1) : 0 });
   const predictPrompt = (p) => (promptModel ? promptModel.predict(p) : []);
 
   // ── Deleted sessions Claude Code recorded itself: exact usage, recovered.
@@ -126,7 +148,7 @@ export function buildReport({ records, pendingTurns, transcriptSessionIds, dupli
     const prompts = (promptsBySessionId.get(rs.sessionId) || []).sort((a, b) => a.ms - b.ms);
     if (!prompts.length) continue; // nothing to place it in time with
     let sessionCost = 0;
-    const weights = prompts.map((p) => (promptModel ? promptModel.baseCost(p) : 1));
+    const weights = prompts.map((p) => (promptModel ? promptModel.baseVolume(p) : 1));
     const wSum = weights.reduce((a, w) => a + w, 0);
     for (const [rawModel, t] of Object.entries(rs.models)) {
       const model = rawModel.replace(/\[[^\]]*\]$/, '');
@@ -142,7 +164,12 @@ export function buildReport({ records, pendingTurns, transcriptSessionIds, dupli
       sessionCost += costUsd || 0;
     }
     for (const p of prompts) reportedPrompts.add(p);
-    if (promptModel) promptModel.addCalibration(prompts, sessionCost);
+    if (promptModel) {
+      promptModel.addCalibration(
+        prompts,
+        Object.entries(rs.models).map(([m, t]) => [m, { input: t.input, output: t.output, cacheWrite: t.cacheWrite, cacheRead: t.cacheRead }]),
+      );
+    }
     reportedSessionCount += 1;
     reportedCostUsd += sessionCost;
   }
@@ -272,6 +299,8 @@ export function buildReport({ records, pendingTurns, transcriptSessionIds, dupli
         tokens: promptEstimateTokens,
         avgCostPerPrompt: estimatedPrompts.length ? promptEstimateCostUsd / estimatedPrompts.length : 0,
         range: promptModel ? promptModel.costRange(estimatedPrompts) : null,
+        // Which models each month's estimate is priced as (usage shares).
+        pricedAs: promptModel ? modelsByMonth(estimatedPrompts, promptModel) : [],
         model: promptModel?.stats() || null,
       },
       reconciliation: recon.stats,

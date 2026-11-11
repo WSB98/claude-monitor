@@ -30,7 +30,7 @@ function buildSinceNote(data) {
   if (ds?.gapTurns && pe) {
     let est = `~${formatCost(pe.costUsd)} estimated for ${ds.gapTurns} prompts with no surviving data`;
     if (pe.range) est += ` (plausible ${formatCost(pe.range.low)}–${formatCost(pe.range.high)})`;
-    if (pe.model) est += `, modeled on your own ${pe.model.basisSessions} sessions by prompt position, project and period`;
+    if (pe.model) est += `, modeled on your own ${pe.model.basisSessions} sessions by prompt position, project and period, and priced at the models you were using then`;
     parts.push(est);
   }
   if (rec?.modeledCostUsd > 0) parts.push(`~${formatCost(rec.modeledCostUsd)} modeled for logged responses missing their final usage`);
