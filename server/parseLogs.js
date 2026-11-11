@@ -1,30 +1,43 @@
 // READ-ONLY BY DESIGN. This module only ever calls readdirSync / statSync /
-// readFileSync against ~/.claude/projects — no write, rename, or delete
-// function is imported anywhere in this project (grep the repo for
-// writeFile/unlink/rm/rename/appendFile — there is nothing to find). Even a
-// session file Claude Code is actively appending to right now is safe to
-// read here: a concurrent OS-level read can't corrupt the source file, and
-// at worst this catches a half-written last line, which the per-line
-// JSON.parse below already tolerates by skipping it.
+// readFileSync / openSync(path, 'r') + readSync against ~/.claude/projects —
+// no write, rename, or delete function is imported anywhere in this project
+// (grep the repo for writeFile/unlink/rm/rename/appendFile — there is
+// nothing to find). Even a session file Claude Code is actively appending
+// to right now is safe to read here: a concurrent OS-level read can't
+// corrupt the source file, and at worst this catches a half-written last
+// line, which is held back and re-tried on the next poll once the rest of
+// it has landed.
 //
 // This also never reads message content — only timestamps, token counts,
 // model IDs, agent identity, and the project directory name. Nothing
 // conversational passes through this tool.
 
-import { readdirSync, statSync, readFileSync } from 'node:fs';
+import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { usageHasTokens } from './usage.js';
 
 const LOG_ROOT = join(homedir(), '.claude', 'projects');
 
-// Real transcripts run a few MB at most. Skip anything wildly larger rather
-// than risk blocking the event loop on a giant synchronous read.
+// Most transcripts run a few MB, but long-lived sessions can grow past
+// 100MB. Anything over this limit isn't read whole (that would block the
+// event loop and balloon memory); it's followed from its tail instead, as a
+// "live-only" file: its recent turns still drive the activity pulse, the
+// live feed and the thinking indicator, but it's left out of every
+// token/cost total since only a slice of its history was ever read.
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
-// filePath -> { mtimeMs, size, records } — skip re-parsing unchanged files
-// (some transcripts run several MB) on every poll.
-const fileCache = new Map();
+// How far back from the end a live-only file is read when first seen (or
+// after falling far behind). Comfortably covers the last several minutes
+// of even a busy session, including the occasional multi-MB tool result.
+const TAIL_BYTES = 8 * 1024 * 1024;
+
+// Live-only records are kept just long enough to feed the pulse's 5-minute
+// warm window and the recent-turns feed, then dropped.
+const LIVE_ONLY_RETAIN_MS = 30 * 60 * 1000;
+
+// filePath -> incremental read state (see newFileState).
+const fileState = new Map();
 const warnedOversize = new Set();
 
 function listProjectDirs() {
@@ -88,83 +101,174 @@ function readAgentMeta(jsonlFilePath) {
   }
 }
 
-// Parses one transcript into usage records, plus whether the transcript's
-// last real turn is still an open "user" turn — a fresh prompt, or a tool
-// result handed back mid-loop — with no assistant reply logged yet. That
-// gap is Claude Code actually thinking/generating: it exists in every
-// transcript, but was previously invisible here since only completed
-// `type: "assistant"` turns carry a `message.usage` block. Subagent lines
-// additionally carry `agentId`, which the caller uses to give each running
-// subagent its own identity in the activity view instead of collapsing it
-// into its parent session.
-function parseFile(filePath, isSubagent) {
-  const text = readFileSync(filePath, 'utf8');
-  const meta = isSubagent ? readAgentMeta(filePath) : null;
-  const records = [];
-  let lastTurn = null; // most recent type:"user"|"assistant" line with a timestamp, in file order
-  let lastModel = null; // most recent assistant model seen — fallback identity for a pending turn that has no reply of its own yet
-  for (const line of text.split('\n')) {
-    if (!line) continue;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue; // truncated/malformed line — most likely a file still being written
-    }
-    if (obj.type === 'assistant' && obj.message?.usage) {
-      lastModel = obj.message.model || lastModel;
-      // Internal placeholder turns (e.g. model: "<synthetic>") carry zero
-      // tokens and aren't real API usage.
-      if (usageHasTokens(obj.message.usage)) {
-        records.push({
-          timestamp: obj.timestamp,
-          model: obj.message.model,
-          cwd: obj.cwd,
-          sessionId: obj.session_id || obj.sessionId,
-          agentId: obj.agentId || null,
-          agentType: meta?.agentType || null,
-          agentLabel: meta?.agentLabel || null,
-          usage: obj.message.usage,
-        });
-      }
-    }
-    if ((obj.type === 'user' || obj.type === 'assistant') && obj.timestamp) {
-      lastTurn = obj;
-    }
-  }
-  // The last real turn being "user" means Claude Code is mid-generation
-  // right now with nothing billed yet for it.
-  const pending = lastTurn?.type === 'user'
-    ? {
-        timestamp: lastTurn.timestamp,
-        cwd: lastTurn.cwd,
-        sessionId: lastTurn.session_id || lastTurn.sessionId,
-        agentId: lastTurn.agentId || null,
-        agentType: meta?.agentType || null,
-        agentLabel: meta?.agentLabel || null,
-        model: lastModel,
-      }
-    : null;
-  return { records, pending };
+// Transcripts are read incrementally: each file keeps a byte offset, and
+// every poll reads only what was appended since the last one. Claude Code
+// only ever appends to these files, so this both avoids re-parsing a
+// multi-MB transcript every few seconds and lets an oversized file be
+// followed from its tail instead of being skipped outright.
+//
+// Per file it tracks the usage records parsed so far, plus whether the
+// transcript's last real turn is still an open "user" turn — a fresh
+// prompt, or a tool result handed back mid-loop — with no assistant reply
+// logged yet. That gap is Claude Code actually thinking/generating: it
+// exists in every transcript, but is otherwise invisible here since only
+// completed `type: "assistant"` turns carry a `message.usage` block.
+// Subagent lines additionally carry `agentId`, which the caller uses to give
+// each running subagent its own identity in the activity view instead of
+// collapsing it into its parent session.
+function newFileState(filePath, isSubagent) {
+  return {
+    offset: 0,
+    skipPartial: false, // discard bytes up to the next newline before parsing (set after jumping into the middle of a file)
+    leftover: null, // trailing bytes of a line Claude Code hasn't finished writing yet
+    records: [],
+    lastTurn: null, // most recent type:"user"|"assistant" line with a timestamp, in file order
+    lastModel: null, // most recent assistant model seen — fallback identity for a pending turn that has no reply of its own yet
+    cwd: null,
+    liveOnly: false,
+    meta: isSubagent ? readAgentMeta(filePath) : null,
+  };
 }
 
-function parsedFile(filePath, isSubagent) {
+function readRange(filePath, start, end) {
+  const length = end - start;
+  const buf = Buffer.allocUnsafe(length);
+  const fd = openSync(filePath, 'r');
+  try {
+    let read = 0;
+    while (read < length) {
+      const n = readSync(fd, buf, read, length - read, start + read);
+      if (n === 0) break;
+      read += n;
+    }
+    return read < length ? buf.subarray(0, read) : buf;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Returns false for a line that isn't (yet) valid JSON.
+function ingestLine(state, line) {
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (!state.cwd && obj.cwd) state.cwd = obj.cwd;
+  if (obj.type === 'assistant' && obj.message?.usage) {
+    state.lastModel = obj.message.model || state.lastModel;
+    // Internal placeholder turns (e.g. model: "<synthetic>") carry zero
+    // tokens and aren't real API usage.
+    if (usageHasTokens(obj.message.usage)) {
+      state.records.push({
+        timestamp: obj.timestamp,
+        model: obj.message.model,
+        cwd: obj.cwd,
+        sessionId: obj.session_id || obj.sessionId,
+        agentId: obj.agentId || null,
+        agentType: state.meta?.agentType || null,
+        agentLabel: state.meta?.agentLabel || null,
+        usage: obj.message.usage,
+      });
+    }
+  }
+  if ((obj.type === 'user' || obj.type === 'assistant') && obj.timestamp) {
+    state.lastTurn = obj.type === 'user'
+      ? { type: 'user', timestamp: obj.timestamp, cwd: obj.cwd, sessionId: obj.session_id || obj.sessionId, agentId: obj.agentId || null }
+      : { type: 'assistant' };
+  }
+  return true;
+}
+
+function ingestBytes(state, chunk) {
+  const data = state.leftover ? Buffer.concat([state.leftover, chunk]) : chunk;
+  state.leftover = null;
+  let pos = 0;
+  if (state.skipPartial) {
+    const nl = data.indexOf(0x0a);
+    if (nl === -1) return; // still inside the line we jumped into
+    state.skipPartial = false;
+    pos = nl + 1;
+  }
+  let nl;
+  while ((nl = data.indexOf(0x0a, pos)) !== -1) {
+    if (nl > pos) ingestLine(state, data.toString('utf8', pos, nl));
+    pos = nl + 1;
+  }
+  if (pos < data.length) {
+    // Either a line still being written, or a final line with no trailing
+    // newline. A truncated JSON object never parses, so try it and hold the
+    // bytes for the next poll if it doesn't.
+    if (!ingestLine(state, data.toString('utf8', pos))) {
+      state.leftover = Buffer.from(data.subarray(pos));
+    }
+  }
+}
+
+function pendingOf(state) {
+  const t = state.lastTurn;
+  // The last real turn being "user" means Claude Code is mid-generation
+  // right now with nothing billed yet for it.
+  if (t?.type !== 'user') return null;
+  return {
+    timestamp: t.timestamp,
+    cwd: t.cwd,
+    sessionId: t.sessionId,
+    agentId: t.agentId,
+    agentType: state.meta?.agentType || null,
+    agentLabel: state.meta?.agentLabel || null,
+    model: state.lastModel,
+  };
+}
+
+// Brings one file's state up to date with whatever was appended since the
+// last poll, and returns it.
+function trackedFile(filePath, isSubagent) {
   const stat = statSync(filePath);
-  if (stat.size > MAX_FILE_BYTES) {
+  let state = fileState.get(filePath);
+  if (state && stat.size < state.offset) state = null; // truncated or replaced — start over
+  if (!state) {
+    state = newFileState(filePath, isSubagent);
+    fileState.set(filePath, state);
+  }
+
+  if (!state.liveOnly && stat.size > MAX_FILE_BYTES) {
+    // Too big to read whole — follow it from the tail instead. Anything
+    // already parsed (a file that grew past the limit while being watched)
+    // is demoted to live-only too, so a transcript's treatment doesn't
+    // depend on whether the server happened to be running when it crossed.
+    state.liveOnly = true;
+    if (state.offset === 0 && Date.now() - stat.mtimeMs > LIVE_ONLY_RETAIN_MS) {
+      // Idle oversized file: nothing in it is recent enough to show, so
+      // don't read any of it — just start watching from the end.
+      state.offset = stat.size - 1;
+      state.skipPartial = true;
+    }
     if (!warnedOversize.has(filePath)) {
       warnedOversize.add(filePath);
-      console.warn(`claude-monitor: skipping oversized log file (${Math.round(stat.size / 1e6)}MB): ${filePath}`);
+      console.warn(`claude-monitor: oversized log file (${Math.round(stat.size / 1e6)}MB), tracking live activity only (excluded from totals): ${filePath}`);
     }
-    return { records: [], pending: null };
   }
-  const cached = fileCache.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-    return cached;
+
+  if (state.liveOnly && stat.size - state.offset > TAIL_BYTES) {
+    // Jump straight to the tail: only recent turns matter for a live-only
+    // file, and this bounds the read no matter how far behind it is.
+    state.offset = stat.size - TAIL_BYTES - 1;
+    state.skipPartial = true;
+    state.leftover = null;
   }
-  const parsed = parseFile(filePath, isSubagent);
-  const entry = { mtimeMs: stat.mtimeMs, size: stat.size, ...parsed };
-  fileCache.set(filePath, entry);
-  return entry;
+
+  if (stat.size > state.offset) {
+    ingestBytes(state, readRange(filePath, state.offset, stat.size));
+    state.offset = stat.size;
+  }
+
+  if (state.liveOnly) {
+    const cutoff = Date.now() - LIVE_ONLY_RETAIN_MS;
+    state.records = state.records.filter((r) => new Date(r.timestamp).getTime() >= cutoff);
+  }
+  return state;
 }
 
 // A project's display name comes from whichever cwd is found first among
@@ -176,62 +280,55 @@ function parsedFile(filePath, isSubagent) {
 // a subdirectory — e.g. a monorepo's api/ folder — would get silently
 // split out into its own fake "project" instead of rolling up into the
 // real one.
-function resolveProjectDir(projectDir) {
-  const files = listSessionFiles(projectDir);
-  const ordered = [...files].sort((a, b) => Number(a.isSubagent) - Number(b.isSubagent));
-  let projectName = null;
-  for (const file of ordered) {
-    try {
-      const { records, pending } = parsedFile(file.path, file.isSubagent);
-      const cwd = records[0]?.cwd || pending?.cwd;
-      if (cwd) {
-        projectName = projectNameFromCwd(cwd);
-        break;
-      }
-    } catch {
-      // file may have been rotated/deleted mid-scan — try the next one
-    }
-  }
-  return { files, projectName: projectName || 'unknown' };
+function projectNameFor(tracked) {
+  const ordered = [...tracked].sort((a, b) => Number(a.isSubagent) - Number(b.isSubagent));
+  const cwd = ordered.find((t) => t.state.cwd)?.state.cwd;
+  return cwd ? projectNameFromCwd(cwd) : 'unknown';
 }
 
-// Returns every usage record across every local Claude Code project log,
-// main-thread and subagent alike.
-export function collectUsageRecords() {
-  const all = [];
+// One pass over every local Claude Code project log, main-thread and
+// subagent alike. Returns:
+//  - records: every usage record. Ones from oversized files carry
+//    `liveOnly: true` — aggregate.js uses them for live activity only.
+//  - pendingTurns: one entry per session/subagent that's currently
+//    mid-turn (prompt or tool result submitted, no reply logged yet), so
+//    the activity pulse lights up the instant a session starts working
+//    instead of waiting for its first token-bearing reply.
+//  - liveOnlyFiles: how many transcripts are being tailed rather than
+//    fully counted, so the UI can say so.
+export function collectLogs() {
+  const records = [];
+  const pendingTurns = [];
+  const seen = new Set();
+  let liveOnlyFiles = 0;
+
   for (const projectDir of listProjectDirs()) {
-    const { files, projectName } = resolveProjectDir(projectDir);
-    for (const file of files) {
+    const tracked = [];
+    for (const file of listSessionFiles(projectDir)) {
       try {
-        for (const rec of parsedFile(file.path, file.isSubagent).records) {
-          all.push({ ...rec, project: projectName });
-        }
+        tracked.push({ isSubagent: file.isSubagent, state: trackedFile(file.path, file.isSubagent) });
+        seen.add(file.path);
       } catch {
         // file may have been rotated/deleted mid-scan — skip it this pass
       }
     }
-  }
-  return all;
-}
-
-// One entry per session/subagent that's currently mid-turn: a prompt or
-// tool result has been submitted and no assistant reply is logged yet.
-// Lets the activity pulse show a session as active the instant it starts
-// working instead of waiting for its first token-bearing reply.
-export function collectPendingTurns() {
-  const all = [];
-  for (const projectDir of listProjectDirs()) {
-    const { files, projectName } = resolveProjectDir(projectDir);
-    for (const file of files) {
-      try {
-        const pending = parsedFile(file.path, file.isSubagent).pending;
-        if (pending) all.push({ ...pending, project: projectName });
-      } catch {
-        // file may have been rotated/deleted mid-scan — skip it this pass
+    const project = projectNameFor(tracked);
+    for (const { state } of tracked) {
+      if (state.liveOnly) liveOnlyFiles += 1;
+      for (const rec of state.records) {
+        records.push({ ...rec, project, liveOnly: state.liveOnly });
       }
+      const pending = pendingOf(state);
+      if (pending) pendingTurns.push({ ...pending, project, liveOnly: state.liveOnly });
     }
   }
-  return all;
+
+  // Forget files that no longer exist so their state doesn't pile up.
+  for (const path of fileState.keys()) {
+    if (!seen.has(path)) fileState.delete(path);
+  }
+
+  return { records, pendingTurns, liveOnlyFiles };
 }
 
 export function logRootExists() {

@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collectUsageRecords, collectPendingTurns, logRootExists, scannedProjectCount } from './parseLogs.js';
+import { collectLogs, logRootExists, scannedProjectCount } from './parseLogs.js';
 import { aggregate } from './aggregate.js';
 import { readRecoveredStats, readPromptHistory } from './history.js';
 import { mergeHistorical } from './merge.js';
@@ -48,11 +48,10 @@ async function serveStatic(req, res) {
 function serveUsage(req, res) {
   let payload;
   try {
-    const records = collectUsageRecords();
-    const pendingTurns = collectPendingTurns();
+    const { records, pendingTurns, liveOnlyFiles } = collectLogs();
     const live = aggregate(records, pendingTurns);
     const merged = mergeHistorical(live, readRecoveredStats(), readPromptHistory());
-    payload = { ok: true, logRootExists: logRootExists(), scannedProjects: scannedProjectCount(), ...merged };
+    payload = { ok: true, logRootExists: logRootExists(), scannedProjects: scannedProjectCount(), liveOnlyFiles, ...merged };
   } catch (err) {
     payload = { ok: false, error: err.message };
   }

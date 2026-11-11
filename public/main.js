@@ -325,7 +325,10 @@ async function poll() {
       const historyCount = data.allProjectsHistory.length;
       const projectNote = `${data.scannedProjects} project${data.scannedProjects === 1 ? '' : 's'} on disk · ${data.byProject.length} with live transcripts`;
       const historyNote = historyCount ? ` · ${historyCount} in full history` : '';
-      el('footerNote').textContent = `claude-monitor · ${projectNote}${historyNote}${buildSinceNote(data)}`;
+      const liveOnlyNote = data.liveOnlyFiles
+        ? ` · ${data.liveOnlyFiles} oversized transcript${data.liveOnlyFiles === 1 ? '' : 's'} tracked for live activity only (not in totals)`
+        : '';
+      el('footerNote').textContent = `claude-monitor · ${projectNote}${historyNote}${liveOnlyNote}${buildSinceNote(data)}`;
     }
 
     renderPeriodStats(data);

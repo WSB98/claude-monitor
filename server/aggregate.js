@@ -74,6 +74,7 @@ function emptyNode() {
     recMs: -Infinity, timestamp: null, project: null, model: null, isSubagent: false,
     agentType: null, agentLabel: null, recentTokens: 0, recentCostUsd: 0,
     recentInput: 0, recentOutput: 0, recentCache: 0, isThinking: false, thinkingSince: null,
+    liveOnly: false,
   };
 }
 
@@ -110,35 +111,42 @@ export function aggregate(records, pendingTurns = []) {
   for (const rec of sorted) {
     const tok = breakdown(rec.usage);
     const rawCost = costForUsage(rec.model, rec.usage);
-    if (rawCost == null) {
-      unpricedTokens += bucketTokens(tok);
-      unpricedModels.add(rec.model || 'unknown');
-    }
     const cost = rawCost || 0;
     const recMs = new Date(rec.timestamp).getTime();
     const ageMs = now - recMs;
 
-    accumulate(totals, tok, cost);
-
-    for (const key of Object.keys(PERIOD_WINDOWS_MS)) {
-      if (ageMs >= 0 && ageMs <= PERIOD_WINDOWS_MS[key]) {
-        accumulate(periods[key], tok, cost);
-        bumpMap(byProjectPeriod[key], rec.project, tok, cost);
-        bumpMap(byModelPeriod[key], rec.model, tok, cost);
+    // Records from an oversized transcript (see parseLogs.js) are only the
+    // tail of its history, so counting them in any total would be a
+    // misleading partial number. They still feed the live activity below.
+    if (!rec.liveOnly) {
+      if (rawCost == null) {
+        unpricedTokens += bucketTokens(tok);
+        unpricedModels.add(rec.model || 'unknown');
       }
+
+      accumulate(totals, tok, cost);
+
+      for (const key of Object.keys(PERIOD_WINDOWS_MS)) {
+        if (ageMs >= 0 && ageMs <= PERIOD_WINDOWS_MS[key]) {
+          accumulate(periods[key], tok, cost);
+          bumpMap(byProjectPeriod[key], rec.project, tok, cost);
+          bumpMap(byModelPeriod[key], rec.model, tok, cost);
+        }
+      }
+
+      bumpMap(byDay, dayKeyOf(rec.timestamp), tok, cost);
+      bumpMap(byMonth, dayKeyOf(rec.timestamp).slice(0, 7), tok, cost);
+      if (ageMs >= 0) {
+        const weekIdx = Math.floor(ageMs / (7 * DAY_MS));
+        if (weekIdx < HISTORY_WEEKS) bumpMap(byWeekIdx, weekIdx, tok, cost);
+      }
+
+      bumpMap(byProject, rec.project, tok, cost);
+      bumpMap(byModel, rec.model, tok, cost);
+
+      if (rec.sessionId) sessions.add(rec.sessionId);
+      if (!firstEventAt || rec.timestamp < firstEventAt) firstEventAt = rec.timestamp;
     }
-
-    bumpMap(byDay, dayKeyOf(rec.timestamp), tok, cost);
-    bumpMap(byMonth, dayKeyOf(rec.timestamp).slice(0, 7), tok, cost);
-    if (ageMs >= 0) {
-      const weekIdx = Math.floor(ageMs / (7 * DAY_MS));
-      if (weekIdx < HISTORY_WEEKS) bumpMap(byWeekIdx, weekIdx, tok, cost);
-    }
-
-    bumpMap(byProject, rec.project, tok, cost);
-    bumpMap(byModel, rec.model, tok, cost);
-
-    if (rec.sessionId) sessions.add(rec.sessionId);
 
     // A subagent gets its own node (keyed by agentId) so N subagents
     // running in parallel under one session show as N pulses, not one.
@@ -159,6 +167,7 @@ export function aggregate(records, pendingTurns = []) {
         node.agentType = rec.agentType;
         node.agentLabel = rec.agentLabel;
       }
+      if (rec.liveOnly) node.liveOnly = true;
       // Volume for the pulse animation: total throughput for this node
       // within the warm window, not just its single latest turn. Kept
       // split by type too, so the pulse can show input/output/cache as
@@ -173,7 +182,6 @@ export function aggregate(records, pendingTurns = []) {
     }
 
     if (!lastEventAt || rec.timestamp > lastEventAt) lastEventAt = rec.timestamp;
-    if (!firstEventAt || rec.timestamp < firstEventAt) firstEventAt = rec.timestamp;
   }
 
   // Fold in sessions/subagents that are mid-turn right now — prompt or tool
@@ -198,6 +206,7 @@ export function aggregate(records, pendingTurns = []) {
     node.agentType = node.agentType || p.agentType;
     node.agentLabel = node.agentLabel || p.agentLabel;
     node.isSubagent = node.isSubagent || Boolean(p.agentId);
+    if (p.liveOnly) node.liveOnly = true;
     if (pendingMs > node.recMs) {
       node.recMs = pendingMs;
       node.timestamp = p.timestamp;
@@ -246,6 +255,7 @@ export function aggregate(records, pendingTurns = []) {
       model: rec.model,
       tokens: bucketTokens(breakdown(rec.usage)),
       costUsd: costForUsage(rec.model, rec.usage),
+      liveOnly: Boolean(rec.liveOnly),
     }));
 
   // Every session or subagent whose most recent turn landed within
@@ -270,6 +280,7 @@ export function aggregate(records, pendingTurns = []) {
       cache: s.recentCache,
       isThinking: s.isThinking,
       thinkingSince: s.thinkingSince,
+      liveOnly: s.liveOnly,
     }))
     .filter((n) => n.msAgo >= 0 && n.msAgo <= WARM_WINDOW_MS);
 

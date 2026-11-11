@@ -232,6 +232,7 @@ export function createNetworkViz(canvas) {
     lines.push(n.isThinking ? `thinking since ${formatRelative(n.thinkingSince)}` : `last event ${formatRelative(n.lastEventAt)}`);
     lines.push(`${formatTokens(n.tokens)} tok / ${formatCost(n.costUsd)} (5m window)`);
     if (n.tokens) lines.push(`in ${formatTokens(n.input)} · out ${formatTokens(n.output)} · cache ${formatTokens(n.cache)}`);
+    if (n.liveOnly) lines.push('oversized transcript · live only, not in totals');
     return lines;
   }
 
